@@ -110,12 +110,14 @@ type AssetDetail struct {
 }
 
 // ForecastStatus — статус прогноза: active (актуальный), superseded (заменён
-// более свежим — история остаётся для аудита формулы).
+// более свежим — история остаётся для аудита формулы), resolved (сверен с фактом
+// через 24ч — терминальный статус с записью в outcomes).
 type ForecastStatus string
 
 const (
 	ForecastStatusActive     ForecastStatus = "active"
 	ForecastStatusSuperseded ForecastStatus = "superseded"
+	ForecastStatusResolved   ForecastStatus = "resolved"
 )
 
 // Forecast — запись прогноза «вверх/вниз за 24ч» по активу на момент времени.
@@ -175,9 +177,9 @@ type ForecastDataView struct {
 // например лента CoinDesk). Сентимент проставляется позже через OpenAI.
 type NewsItem struct {
 	ID               int64
-	AssetID          *int64  // nullable: связь с монетой, если возможно
+	AssetID          *int64 // nullable: связь с монетой, если возможно
 	SourceID         int64
-	ExternalID       string  // идентификатор новости у источника (для дедупа)
+	ExternalID       string // идентификатор новости у источника (для дедупа)
 	Title            string
 	Body             string
 	Link             string
@@ -189,11 +191,11 @@ type NewsItem struct {
 
 // NewsItemView — DTO новости для API: только то, что нужно карточке прогноза.
 type NewsItemView struct {
-	Title            string   `json:"title"`
-	Link             string   `json:"link"`
+	Title            string    `json:"title"`
+	Link             string    `json:"link"`
 	PublishedAt      time.Time `json:"published_at"`
-	SentimentScore   *float64 `json:"sentiment_score"`   // null, если не оценён
-	SentimentSummary *string  `json:"sentiment_summary"` // null, если не оценён
+	SentimentScore   *float64  `json:"sentiment_score"`   // null, если не оценён
+	SentimentSummary *string   `json:"sentiment_summary"` // null, если не оценён
 }
 
 // ForecastView — DTO для эндпоинта GET /api/forecasts/:asset: полный прогноз
@@ -212,6 +214,12 @@ type ForecastView struct {
 	Factors      []ForecastFactorView `json:"factors"`
 	Data         ForecastDataView     `json:"data"`
 	News         []NewsItemView       `json:"news"`
+	// T5: результат сверки текущего прогноза (nil, если ещё не resolved — меньше 24ч).
+	Result             *OutcomeResult `json:"result,omitempty"`
+	CulpritFactor      string         `json:"culprit_factor,omitempty"`
+	CulpritExplanation string         `json:"culprit_explanation,omitempty"`
+	// T5: история последних прогнозов по монете с результатами сверки.
+	History []ForecastHistoryItem `json:"history"`
 }
 
 // ForecastSummary — краткий прогноз для списка и главной страницы:
@@ -223,4 +231,75 @@ type ForecastSummary struct {
 	Direction  string    `json:"direction"`
 	Confidence float64   `json:"confidence"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+// --- T5: точность прогнозов, атрибуция ошибок, адаптация весов ---
+
+// OutcomeResult — результат сверки прогноза с фактом через 24ч.
+type OutcomeResult string
+
+const (
+	OutcomeHit     OutcomeResult = "hit"     // направление совпало с фактом
+	OutcomeMiss    OutcomeResult = "miss"    // направление не совпало (|change| ≥ 0.5%)
+	OutcomeNeutral OutcomeResult = "neutral" // слишком маленькое движение (|change| < 0.5%)
+)
+
+// Outcome — результат сверки прогноза с фактическим изменением цены. Один к одному
+// с прогнозом (forecast_id PK). culprit — фактор, сильнее всего «виновный» в промахе
+// (при miss) или ведущий (при hit).
+type Outcome struct {
+	ForecastID         int64
+	ResolvedAt         time.Time
+	ActualDirection    string        // "up" | "down"
+	Result             OutcomeResult // hit | miss | neutral
+	PriceAtForecast    float64
+	PriceAtResolution  float64
+	PriceChangePct     float64 // (resolution/forecast − 1) × 100
+	CulpritFactor      string
+	CulpritExplanation string
+}
+
+// FactorStat — скользящая статистика точности фактора по монете. HitRateEMA —
+// экспоненциальное среднее доли совпадений знака сигнала с фактом. Используется
+// для адаптации весов в прогнозе.
+type FactorStat struct {
+	AssetID    int64
+	Factor     string
+	HitRateEMA float64 // [0..1], стартует с 0.5 (нейтрально)
+	Samples    int
+	UpdatedAt  time.Time
+}
+
+// ForecastHistoryItem — одна строка истории прогнозов по монете с результатом
+// сверки и «виновником» промаха. DTO для секции «История точности» в UI.
+type ForecastHistoryItem struct {
+	ForecastID         int64         `json:"forecast_id"`
+	CreatedAt          time.Time     `json:"created_at"`
+	Direction          string        `json:"direction"`
+	Confidence         float64       `json:"confidence"`
+	Result             OutcomeResult `json:"result"`
+	CulpritFactor      string        `json:"culprit_factor,omitempty"`
+	CulpritExplanation string        `json:"culprit_explanation,omitempty"`
+	PriceChangePct     float64       `json:"price_change_pct"`
+	ActualDirection    string        `json:"actual_direction"`
+}
+
+// FactorHitRateView — DTO hit-rate одного фактора для глобальной сводки точности.
+type FactorHitRateView struct {
+	Factor     string  `json:"factor"`
+	HitRateEMA float64 `json:"hit_rate_ema"`
+	Samples    int     `json:"samples"`
+}
+
+// AccuracySummary — глобальная сводка точности прогнозов. DTO для GET /api/accuracy.
+// Accuracy = hits / (hits + misses). AvgConfidence — средняя заявленная уверенность
+// по тем же прогнозам (чтобы сравнить с фактической точностью).
+type AccuracySummary struct {
+	Total         int                 `json:"total"`
+	Hits          int                 `json:"hits"`
+	Misses        int                 `json:"misses"`
+	Neutrals      int                 `json:"neutrals"`
+	Accuracy      float64             `json:"accuracy"`       // hits / (hits + misses), 0 если нет данных
+	AvgConfidence float64             `json:"avg_confidence"` // средняя confidence resolved-прогнозов
+	PerFactor     []FactorHitRateView `json:"per_factor"`
 }

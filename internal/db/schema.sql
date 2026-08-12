@@ -125,3 +125,32 @@ CREATE INDEX IF NOT EXISTS idx_news_items_asset_published
     ON news_items (asset_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_items_unscored
     ON news_items (source_id) WHERE sentiment_score IS NULL;
+
+-- Результаты сверки прогнозов с фактом (T5). Одна строка на прогноз, который
+-- достиг горизонта (24ч) и был сверен с фактическим изменением цены.
+-- result: hit (направление совпало) | miss (не совпало, |change| ≥ 0.5%)
+--       | neutral (|change| < 0.5% — слишком маленькое движение).
+-- culprit_factor — фактор, «виновный» в промахе (при miss) или ведущий (при hit).
+CREATE TABLE IF NOT EXISTS outcomes (
+    forecast_id         INTEGER PRIMARY KEY REFERENCES forecasts(id) ON DELETE CASCADE,
+    resolved_at         DATETIME NOT NULL,
+    actual_direction    TEXT    NOT NULL,                  -- "up" | "down"
+    result              TEXT    NOT NULL,                  -- "hit" | "miss" | "neutral"
+    price_at_forecast   REAL    NOT NULL,
+    price_at_resolution REAL    NOT NULL,
+    price_change_pct    REAL    NOT NULL,                  -- (resolution/forecast − 1) × 100
+    culprit_factor      TEXT    NOT NULL DEFAULT '',
+    culprit_explanation TEXT    NOT NULL DEFAULT ''
+);
+
+-- Скользящая статистика точности каждого фактора по монете (T5). hit_rate_ema —
+-- экспоненциальное среднее доли совпадений знака сигнала с фактом (α=0.2).
+-- Используется для адаптации весов: чем чаще фактор угадывает, тем больше его вес.
+CREATE TABLE IF NOT EXISTS factor_stats (
+    asset_id      INTEGER NOT NULL REFERENCES assets(id),
+    factor        TEXT    NOT NULL,                        -- "rsi" | "momentum" | "volume" | "sentiment"
+    hit_rate_ema  REAL    NOT NULL DEFAULT 0.5,            -- [0..1], старт с 0.5 (нейтрально)
+    samples       INTEGER NOT NULL DEFAULT 0,
+    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (asset_id, factor)
+);

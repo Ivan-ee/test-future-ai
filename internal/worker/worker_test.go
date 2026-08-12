@@ -75,29 +75,33 @@ func newWorkerDB(t *testing.T) *sqlx.DB {
 }
 
 // workerDeps — набор репозиториев + сентимент-сервис для тестового worker.
-// Собирается один раз и переиспользуется, чтобы не дублировать 11 параметров.
+// Собирается один раз и переиспользуется, чтобы не дублировать параметры.
 type workerDeps struct {
-	assets    *storage.Assets
-	sources   *storage.Sources
-	prices    *storage.PricePoints
-	logs      *storage.UpdateLog
-	indicators *storage.IndicatorSnapshots
-	forecasts *storage.Forecasts
-	news      *storage.NewsItems
-	sentiment *sentiment.Service
+	assets      *storage.Assets
+	sources     *storage.Sources
+	prices      *storage.PricePoints
+	logs        *storage.UpdateLog
+	indicators  *storage.IndicatorSnapshots
+	forecasts   *storage.Forecasts
+	news        *storage.NewsItems
+	sentiment   *sentiment.Service
+	outcomes    *storage.Outcomes    // T5
+	factorStats *storage.FactorStats // T5
 }
 
 func newWorkerDeps(d *sqlx.DB) workerDeps {
 	news := storage.NewNewsItems(d)
 	return workerDeps{
-		assets:     storage.NewAssets(d),
-		sources:    storage.NewSources(d),
-		prices:     storage.NewPricePoints(d),
-		logs:       storage.NewUpdateLog(d),
-		indicators: storage.NewIndicatorSnapshots(d),
-		forecasts:  storage.NewForecasts(d),
-		news:       news,
-		sentiment:  sentiment.New("", news), // noop по умолчанию
+		assets:      storage.NewAssets(d),
+		sources:     storage.NewSources(d),
+		prices:      storage.NewPricePoints(d),
+		logs:        storage.NewUpdateLog(d),
+		indicators:  storage.NewIndicatorSnapshots(d),
+		forecasts:   storage.NewForecasts(d),
+		news:        news,
+		sentiment:   sentiment.New("", news), // noop по умолчанию
+		outcomes:    storage.NewOutcomes(d),
+		factorStats: storage.NewFactorStats(d),
 	}
 }
 
@@ -111,6 +115,7 @@ func newTestWorker(t *testing.T, d *sqlx.DB, taker fakeTaker, deps workerDeps) *
 		fakeRSSTaker{},
 		deps.assets, deps.sources, deps.prices, deps.logs,
 		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+		deps.outcomes, deps.factorStats,
 	)
 }
 
@@ -431,6 +436,7 @@ func TestFetchNews_CoinPaprikaWritesItems(t *testing.T) {
 		config.Config{FetchIntervalMin: 10}, taker, news, fakeRSSTaker{},
 		deps.assets, deps.sources, deps.prices, deps.logs,
 		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+		deps.outcomes, deps.factorStats,
 	)
 
 	w.fetchOnce(ctx)
@@ -474,6 +480,7 @@ func TestFetchNews_RSSWritesItems(t *testing.T) {
 		config.Config{FetchIntervalMin: 10}, taker, fakeNewsTaker{}, rssTaker,
 		deps.assets, deps.sources, deps.prices, deps.logs,
 		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+		deps.outcomes, deps.factorStats,
 	)
 
 	w.fetchOnce(ctx)
@@ -563,3 +570,152 @@ func factorNames(factors []model.ForecastFactor) []string {
 
 // timeNowUTC — текущий момент в UTC (для published_at в тестах).
 func timeNowUTC() (t time.Time) { return time.Now().UTC() }
+
+// --- T5: resolve-цикл и адаптация весов ---
+
+// TestResolveOnce_CreatesOutcomeAndUpdatesStats — прогноз старше 24ч сверен с
+// фактом: создаётся outcome и обновляется factor_stats.
+func TestResolveOnce_CreatesOutcomeAndUpdatesStats(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
+
+	chart := buildMonotonicChart(25, 1723334400000)
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
+				CurrentPrice: 25, TotalVolume: 1000, LastUpdated: "2024-09-04T00:00:00Z"},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := newTestWorker(t, d, taker, deps)
+
+	// Сначала индикаторы + прогноз.
+	w.fetchOnce(ctx)
+	w.computeForecasts(ctx)
+
+	// Делаем прогноз «старым» — сдвигаем created_at на 25ч назад.
+	_, err := d.ExecContext(ctx, `UPDATE forecasts SET created_at = ? WHERE status = ?`,
+		time.Now().UTC().Add(-25*time.Hour), string(model.ForecastStatusActive))
+	if err != nil {
+		t.Fatalf("сдвиг created_at: %v", err)
+	}
+
+	// Добавляем «текущую» цену (resolution) — выше цены на момент прогноза,
+	// чтобы прогноз «вверх» получил hit и factor_stats обновился.
+	assetID := int64(1)
+	srcID := int64(1)
+	_, err = d.ExecContext(ctx,
+		`INSERT OR IGNORE INTO price_points (asset_id, ts, price_usd, market_cap, volume, source_id, change_24h)
+		 VALUES (?, ?, ?, 0, 0, ?, 0)`,
+		assetID, time.Now().UTC(), 28, srcID)
+	if err != nil {
+		t.Fatalf("вставка resolution-цены: %v", err)
+	}
+
+	// Запускаем resolve.
+	w.resolveOnce(ctx)
+
+	// Должен появиться outcome.
+	var nOutcomes int
+	if err := d.GetContext(ctx, &nOutcomes, `SELECT COUNT(*) FROM outcomes`); err != nil {
+		t.Fatalf("count outcomes: %v", err)
+	}
+	if nOutcomes != 1 {
+		t.Fatalf("хотели 1 outcome, получили %d", nOutcomes)
+	}
+
+	// Результат — hit (прогноз вверх, цена выросла 25→28 = +12%).
+	var result string
+	if err := d.GetContext(ctx, &result, `SELECT result FROM outcomes LIMIT 1`); err != nil {
+		t.Fatalf("select result: %v", err)
+	}
+	if model.OutcomeResult(result) != model.OutcomeHit {
+		t.Errorf("хотели result=hit, получили %s", result)
+	}
+
+	// Прогноз переведён в resolved.
+	var status string
+	if err := d.GetContext(ctx, &status, `SELECT status FROM forecasts WHERE id = (SELECT forecast_id FROM outcomes LIMIT 1)`); err != nil {
+		t.Fatalf("select forecast status: %v", err)
+	}
+	if model.ForecastStatus(status) != model.ForecastStatusResolved {
+		t.Errorf("хотели status=resolved, получили %s", status)
+	}
+
+	// factor_stats должен иметь записи для каждого фактора прогноза (3 фактора
+	// без sentiment — новостей нет).
+	var nStats int
+	if err := d.GetContext(ctx, &nStats, `SELECT COUNT(*) FROM factor_stats WHERE asset_id = 1`); err != nil {
+		t.Fatalf("count factor_stats: %v", err)
+	}
+	if nStats != 3 {
+		t.Errorf("хотели 3 factor_stats (3 фактора), получили %d", nStats)
+	}
+}
+
+// TestAdaptedWeights_FactorStatsAffectsForecast — при наличии factor_stats с
+// низкой hit_rate_ema вес фактора понижается, что видно в декомпозиции прогноза.
+func TestAdaptedWeights_FactorStatsAffectsForecast(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
+
+	chart := buildMonotonicChart(25, 1723334400000)
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
+				CurrentPrice: 25, TotalVolume: 1000, LastUpdated: "2024-09-04T00:00:00Z"},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := newTestWorker(t, d, taker, deps)
+
+	// Без статистики — прогноз с дефолтными весами.
+	w.fetchOnce(ctx)
+	w.computeForecasts(ctx)
+
+	_, factorsBefore, err := deps.forecasts.LatestByAsset(ctx, 1)
+	if err != nil {
+		t.Fatalf("прогноз (до): %v", err)
+	}
+
+	// Устанавливаем factor_stats: momentum имеет низкий hit_rate (0.1) → понижение.
+	lowEMA := 0.1
+	if err := deps.factorStats.Upsert(ctx, model.FactorStat{
+		AssetID: 1, Factor: string(scoring.FactorMomentum),
+		HitRateEMA: lowEMA, Samples: 10, UpdatedAt: timeNowUTC(),
+	}); err != nil {
+		t.Fatalf("factor_stats upsert: %v", err)
+	}
+
+	// Пересчитываем прогноз — momentum должен получить пониженный вес.
+	// Переводим старый active в superseded, чтобы Save создал новый active.
+	w.computeForecasts(ctx)
+
+	_, factorsAfter, err := deps.forecasts.LatestByAsset(ctx, 1)
+	if err != nil {
+		t.Fatalf("прогноз (после): %v", err)
+	}
+
+	// Находим momentum до и после.
+	var momWeightBefore, momWeightAfter float64
+	for _, f := range factorsBefore {
+		if f.Name == string(scoring.FactorMomentum) {
+			momWeightBefore = f.BaseWeight
+		}
+	}
+	for _, f := range factorsAfter {
+		if f.Name == string(scoring.FactorMomentum) {
+			momWeightAfter = f.BaseWeight
+		}
+	}
+	// BaseWeight в forecast_factors хранит уже адаптированный вес (переданный
+	// в scoring как weights). При EMA=0.1 множитель = clamp(0.1/0.5,0.5,1.5)=0.5.
+	if momWeightAfter >= momWeightBefore {
+		t.Errorf("при низкой hit_rate вес momentum должен понизиться: до=%v, после=%v",
+			momWeightBefore, momWeightAfter)
+	}
+}

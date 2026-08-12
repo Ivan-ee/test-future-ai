@@ -13,7 +13,7 @@ import {
   formatPrice,
   formatTime,
 } from "@/lib/format";
-import type { ForecastFactorView, NewsItemView } from "@/lib/types";
+import type { ForecastFactorView, ForecastHistoryItem, NewsItemView, OutcomeResult } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -24,6 +24,31 @@ const FACTOR_LABELS: Record<string, string> = {
   volume: "Объём (интерес рынка)",
   sentiment: "Сентимент новостей",
 };
+
+// resultStyle — общий маппинг результата сверки в CSS-класс и короткий текст.
+// Используется и в ResultBadge, и в HistoryRow — единый источник правды.
+function resultStyle(result: OutcomeResult): { cls: string; short: string; full: string } {
+  switch (result) {
+    case "hit":
+      return {
+        cls: "bg-green-900/50 text-green-400",
+        short: "✓ попадание",
+        full: "✓ попадание — направление угадано",
+      };
+    case "miss":
+      return {
+        cls: "bg-red-900/50 text-red-400",
+        short: "✗ промах",
+        full: "✗ промах — направление не совпало",
+      };
+    default:
+      return {
+        cls: "bg-gray-800 text-gray-400",
+        short: "≈ нейтрально",
+        full: "≈ нейтрально — движение слишком маленькое",
+      };
+  }
+}
 
 export default async function ForecastPage({
   params,
@@ -130,6 +155,19 @@ export default async function ForecastPage({
           <div className="text-xs uppercase text-gray-500">Риск</div>
           <div className="mt-1 text-sm text-gray-300">{forecast.risk_note}</div>
         </div>
+
+        {/* T5: результат сверки, если прогноз уже resolved (старше 24ч) */}
+        {forecast.result && (
+          <div className="mt-4 rounded-lg border border-gray-700 bg-gray-950/50 p-3">
+            <div className="text-xs uppercase text-gray-500">Результат сверки (24ч)</div>
+            <div className="mt-1 flex items-center gap-2">
+              <ResultBadge result={forecast.result} />
+              {forecast.culprit_explanation && (
+                <span className="text-sm text-gray-400">{forecast.culprit_explanation}</span>
+              )}
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Аргументация прогноза */}
@@ -180,6 +218,21 @@ export default async function ForecastPage({
           <ul className="space-y-3">
             {forecast.news.map((n, i) => (
               <NewsCard key={i} news={n} />
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* История точности (T5) */}
+      {forecast.history.length > 0 && (
+        <section className="mb-8">
+          <h2 className="mb-4 text-xl font-semibold text-white">История точности</h2>
+          <p className="mb-3 text-xs text-gray-500">
+            Прошлые прогнозы по этой монете с результатами сверки через 24ч.
+          </p>
+          <ul className="space-y-2">
+            {forecast.history.map((h) => (
+              <HistoryRow key={h.forecast_id} item={h} />
             ))}
           </ul>
         </section>
@@ -272,6 +325,51 @@ function NewsCard({ news }: { news: NewsItemView }) {
         <p className="mt-2 text-sm text-gray-400">{news.sentiment_summary}</p>
       )}
       <p className="mt-1 text-xs text-gray-600">{formatTime(news.published_at)}</p>
+    </li>
+  );
+}
+
+// ResultBadge — компактный бейдж результата сверки прогноза.
+function ResultBadge({ result }: { result: OutcomeResult }) {
+  const style = resultStyle(result);
+  return (
+    <span className={`shrink-0 rounded-md px-2 py-1 text-sm font-semibold ${style.cls}`}>
+      {style.full}
+    </span>
+  );
+}
+
+// HistoryRow — строка истории прогноза с hit/miss-бейджем и culprit при miss.
+function HistoryRow({ item }: { item: ForecastHistoryItem }) {
+  const predictedDir = item.direction === "up" ? "↑" : "↓";
+  const changePct = item.price_change_pct.toFixed(2);
+  const changeUp = item.price_change_pct >= 0;
+  const style = resultStyle(item.result);
+
+  return (
+    <li className="rounded-lg border border-gray-800 bg-gray-900/60 px-4 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3 text-sm">
+          <span className="text-gray-500">{formatTime(item.created_at)}</span>
+          <span className="text-gray-300">
+            прогноз: <span className="font-medium">{predictedDir}</span>
+          </span>
+          <span className="text-xs text-gray-500">
+            факт: <span className={changeUp ? "text-green-400" : "text-red-400"}>
+              {changeUp ? "+" : ""}{changePct}%
+            </span>
+          </span>
+        </div>
+        <span className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-semibold ${style.cls}`}>
+          {style.short}
+        </span>
+      </div>
+      {/* Culprit — только при miss */}
+      {item.result === "miss" && item.culprit_explanation && (
+        <p className="mt-2 text-xs text-gray-500">
+          <span className="text-gray-400">Виновник:</span> {item.culprit_explanation}
+        </p>
+      )}
     </li>
   );
 }

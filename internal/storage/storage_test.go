@@ -474,7 +474,7 @@ func TestNewsItems_RecentByAsset_FiltersBySince(t *testing.T) {
 }
 
 // TestNewsItems_AvgSentimentByAsset — средний сентимент по новостям с проставленным score.
-//_nil если нет оценённых новостей.
+// _nil если нет оценённых новостей.
 func TestNewsItems_AvgSentimentByAsset(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

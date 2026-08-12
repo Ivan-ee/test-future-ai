@@ -1,7 +1,7 @@
 // Клиент бэкенда test-future. Базовый URL берётся из публичной env-переменной,
 // которую прокидывает next.config.ts (по умолчанию http://localhost:8081).
 
-import type { AssetDetail, AssetPrice, ForecastSummary, ForecastView } from "./types";
+import type { AccuracySummary, AssetDetail, AssetPrice, ForecastSummary, ForecastView } from "./types";
 
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8081";
@@ -49,6 +49,17 @@ export async function fetchForecastDetail(asset: number | string): Promise<Forec
     throw new Error(`/api/forecasts/${asset} вернул ${res.status}`);
   }
   return res.json() as Promise<ForecastView>;
+}
+
+/** GET /api/accuracy — глобальная сводка точности прогнозов. */
+export async function fetchAccuracy(): Promise<AccuracySummary> {
+  const res = await fetch(`${API_URL}/api/accuracy`, {
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`/api/accuracy вернул ${res.status}`);
+  }
+  return res.json() as Promise<AccuracySummary>;
 }
 
 export { API_URL };

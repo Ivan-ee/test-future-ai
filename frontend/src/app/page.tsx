@@ -1,8 +1,9 @@
 // Главная страница — серверный компонент (App Router).
-// Начальные данные (цены + прогнозы) тянет с бэкенда через server-side fetch;
-// автообновление раз в 30 секунд делает клиентская компонента AssetList.
+// Начальные данные (цены + прогнозы + сводка точности) тянет с бэкенда через
+// server-side fetch; автообновление раз в 30 секунд делает клиентская компонента AssetList.
 
-import { fetchAssets, fetchForecasts } from "@/lib/api";
+import { fetchAccuracy, fetchAssets, fetchForecasts } from "@/lib/api";
+import AccuracyWidget from "@/components/AccuracyWidget";
 import AssetList from "@/components/AssetList";
 
 export const dynamic = "force-dynamic"; // всегда свежие цены при загрузке
@@ -10,12 +11,14 @@ export const dynamic = "force-dynamic"; // всегда свежие цены п
 export default async function HomePage() {
   let initialAssets: Awaited<ReturnType<typeof fetchAssets>> = [];
   let initialForecasts: Awaited<ReturnType<typeof fetchForecasts>> = [];
+  let accuracy: Awaited<ReturnType<typeof fetchAccuracy>> | null = null;
   let loadError: string | null = null;
 
   try {
-    [initialAssets, initialForecasts] = await Promise.all([
+    [initialAssets, initialForecasts, accuracy] = await Promise.all([
       fetchAssets(),
       fetchForecasts().catch(() => [] as Awaited<ReturnType<typeof fetchForecasts>>),
+      fetchAccuracy().catch(() => null),
     ]);
   } catch (e) {
     loadError = e instanceof Error ? e.message : String(e);
@@ -38,7 +41,10 @@ export default async function HomePage() {
           бэкенд запущен (make dev).
         </div>
       ) : (
-        <AssetList initialAssets={initialAssets} initialForecasts={initialForecasts} />
+        <>
+          <AccuracyWidget summary={accuracy} />
+          <AssetList initialAssets={initialAssets} initialForecasts={initialForecasts} />
+        </>
       )}
     </main>
   );

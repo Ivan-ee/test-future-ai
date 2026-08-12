@@ -92,4 +92,46 @@ export interface ForecastView {
   factors: ForecastFactorView[];
   data: ForecastDataView;
   news: NewsItemView[];
+  // T5: результат сверки текущего прогноза (отсутствует, если ещё не resolved — <24ч).
+  result?: "hit" | "miss" | "neutral";
+  culprit_factor?: string;
+  culprit_explanation?: string;
+  // T5: история последних прогнозов по монете с результатами сверки.
+  history: ForecastHistoryItem[];
+}
+
+// --- T5: точность прогнозов ---
+
+/** Результат сверки прогноза с фактом. */
+export type OutcomeResult = "hit" | "miss" | "neutral";
+
+/** Одна строка истории прогнозов по монете с результатом сверки. */
+export interface ForecastHistoryItem {
+  forecast_id: number;
+  created_at: string;
+  direction: "up" | "down";
+  confidence: number;
+  result: OutcomeResult;
+  culprit_factor?: string;
+  culprit_explanation?: string;
+  price_change_pct: number;
+  actual_direction: "up" | "down";
+}
+
+/** Hit-rate одного фактора — элемент глобальной сводки точности. */
+export interface FactorHitRateView {
+  factor: string;
+  hit_rate_ema: number;
+  samples: number;
+}
+
+/** Глобальная сводка точности — ответ GET /api/accuracy. */
+export interface AccuracySummary {
+  total: number;
+  hits: number;
+  misses: number;
+  neutrals: number;
+  accuracy: number; // hits / (hits + misses), 0 если нет данных
+  avg_confidence: number; // средняя confidence resolved-прогнозов
+  per_factor: FactorHitRateView[];
 }

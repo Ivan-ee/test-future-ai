@@ -58,6 +58,8 @@ func run() error {
 	indicatorRepo := storage.NewIndicatorSnapshots(database)
 	forecastRepo := storage.NewForecasts(database)
 	newsRepo := storage.NewNewsItems(database)
+	outcomeRepo := storage.NewOutcomes(database)        // T5
+	factorStatsRepo := storage.NewFactorStats(database) // T5
 
 	// Сентимент-сервис (noop без OPENAI_API_KEY — прогноз на 3 факторах).
 	sentimentSvc := sentiment.New(cfg.OpenAIAPIKey, newsRepo)
@@ -67,11 +69,12 @@ func run() error {
 
 	// Worker: опрос источников в горутине.
 	wkr := worker.New(cfg, assetsRepo, sourcesRepo, priceRepo, logRepo,
-		indicatorRepo, forecastRepo, newsRepo, sentimentSvc)
+		indicatorRepo, forecastRepo, newsRepo, sentimentSvc, outcomeRepo, factorStatsRepo)
 	go wkr.Run(rootCtx)
 
 	// HTTP-сервер.
-	srv := server.New(cfg, priceRepo, indicatorRepo, forecastRepo, assetsRepo, newsRepo)
+	srv := server.New(cfg, priceRepo, indicatorRepo, forecastRepo, assetsRepo, newsRepo,
+		outcomeRepo, factorStatsRepo)
 	httpServer := &http.Server{
 		Addr:              cfg.BackendAddr(),
 		Handler:           srv.Router(),

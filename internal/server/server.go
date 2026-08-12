@@ -10,6 +10,12 @@
 //   - GET /api/forecasts/{asset} — детальная карточка прогноза: направление,
 //     уверенность, риск, декомпозиция по факторам и использованные данные.
 //     Параметр {asset} — id актива (как в /api/assets/{id}).
+//
+// T5: добавлены эндпоинты точности:
+//   - GET /api/accuracy — глобальная сводка: точность за последние N прогнозов,
+//     средняя заявленная уверенность vs фактическая точность, per-factor hit-rate.
+//   - GET /api/forecasts/{asset} расширен секцией history — последние прогнозы
+//     по монете с результатами сверки (hit/miss/neutral) и «виновником» промаха.
 package server
 
 import (
@@ -32,14 +38,22 @@ import (
 	"test-future/internal/storage"
 )
 
+// Сколько прогнозов учитывать в глобальной сводке точности.
+const accuracySampleLimit = 100
+
+// Сколько прогнозов включать в историю по монете.
+const forecastHistoryLimit = 20
+
 // Server хранит зависимости HTTP-слоя.
 type Server struct {
-	cfg            config.Config
-	priceStore     *storage.PricePoints
-	indicatorStore *storage.IndicatorSnapshots
-	forecastStore  *storage.Forecasts
-	assetsStore    *storage.Assets
-	newsStore      *storage.NewsItems
+	cfg             config.Config
+	priceStore      *storage.PricePoints
+	indicatorStore  *storage.IndicatorSnapshots
+	forecastStore   *storage.Forecasts
+	assetsStore     *storage.Assets
+	newsStore       *storage.NewsItems
+	outcomeStore    *storage.Outcomes    // T5: результаты сверки прогнозов
+	factorStatsRepo *storage.FactorStats // T5: статистика точности факторов
 }
 
 // New создаёт сервер с заданными зависимостями.
@@ -50,14 +64,18 @@ func New(
 	forecastStore *storage.Forecasts,
 	assetsStore *storage.Assets,
 	newsStore *storage.NewsItems,
+	outcomeStore *storage.Outcomes,
+	factorStatsRepo *storage.FactorStats,
 ) *Server {
 	return &Server{
-		cfg:            cfg,
-		priceStore:     priceStore,
-		indicatorStore: indicatorStore,
-		forecastStore:  forecastStore,
-		assetsStore:    assetsStore,
-		newsStore:      newsStore,
+		cfg:             cfg,
+		priceStore:      priceStore,
+		indicatorStore:  indicatorStore,
+		forecastStore:   forecastStore,
+		assetsStore:     assetsStore,
+		newsStore:       newsStore,
+		outcomeStore:    outcomeStore,
+		factorStatsRepo: factorStatsRepo,
 	}
 }
 
@@ -88,6 +106,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/assets/{id}", s.handleAssetDetail)
 		r.Get("/forecasts", s.handleForecasts)
 		r.Get("/forecasts/{asset}", s.handleForecastDetail)
+		r.Get("/accuracy", s.handleAccuracy) // T5
 	})
 
 	return r
@@ -155,6 +174,7 @@ func (s *Server) handleForecasts(w http.ResponseWriter, r *http.Request) {
 // handleForecastDetail возвращает детальную карточку прогноза по активу:
 // направление, уверенность, риск, аргументацию, декомпозицию по факторам и
 // использованные данные (цена + индикаторы). 404, если актив или прогноз не найдены.
+// T5: включает историю последних прогнозов с результатами сверки (hit/miss/neutral).
 func (s *Server) handleForecastDetail(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "asset")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -185,7 +205,141 @@ func (s *Server) handleForecastDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	view := s.forecastView(r.Context(), forecast, factors, price)
+
+	// T5: результат сверки текущего прогноза, если он уже resolved.
+	hasOutcome, err := s.outcomeStore.ExistsByForecast(r.Context(), forecast.ID)
+	if err != nil {
+		log.Printf("server: проверка outcome для forecast %d: %v", forecast.ID, err)
+	} else if hasOutcome {
+		s.attachOutcome(r.Context(), &view, forecast.ID)
+	}
+
+	// T5: история последних прогнозов по монете с результатами сверки.
+	history, err := s.outcomeStore.RecentByAsset(r.Context(), id, forecastHistoryLimit)
+	if err != nil {
+		log.Printf("server: история outcomes для asset %d: %v", id, err)
+		history = []model.ForecastHistoryItem{}
+	}
+	view.History = history
+
 	writeJSON(w, http.StatusOK, view)
+}
+
+// attachOutcome дополняет ForecastView результатом сверки прогноза из outcomes.
+func (s *Server) attachOutcome(ctx context.Context, view *model.ForecastView, forecastID int64) {
+	outcome, err := s.outcomeStore.ByForecast(ctx, forecastID)
+	if err != nil {
+		return
+	}
+	result := outcome.Result
+	view.Result = &result
+	view.CulpritFactor = outcome.CulpritFactor
+	view.CulpritExplanation = outcome.CulpritExplanation
+}
+
+// handleAccuracy возвращает глобальную сводку точности прогнозов за последние N
+// сверкнутых прогнозов: общую точность, среднюю уверенность vs фактическую точность
+// и per-factor hit-rate.
+func (s *Server) handleAccuracy(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Последние N resolved-прогнозов.
+	items, err := s.outcomeStore.RecentAll(ctx, accuracySampleLimit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "не удалось получить outcomes"})
+		return
+	}
+
+	// Считаем hits/misses/neutrals и среднюю confidence.
+	// avgConfidence считается только по hit+miss — тем же прогнозам, по которым
+	// считается accuracy, чтобы сравнение «заявленная vs фактическая» было
+	// согласовано (neutral исключаются из обоих знаменателей).
+	hits, misses, neutrals := 0, 0, 0
+	confSum := 0.0
+	confCount := 0
+	for _, item := range items {
+		switch item.Result {
+		case model.OutcomeHit:
+			hits++
+			confSum += item.Confidence
+			confCount++
+		case model.OutcomeMiss:
+			misses++
+			confSum += item.Confidence
+			confCount++
+		case model.OutcomeNeutral:
+			neutrals++
+		}
+	}
+
+	accuracyVal := 0.0
+	if hits+misses > 0 {
+		accuracyVal = float64(hits) / float64(hits+misses)
+	}
+	avgConfidence := 0.0
+	if confCount > 0 {
+		avgConfidence = confSum / float64(confCount)
+	}
+
+	// Per-factor hit-rate — агрегат по всем активам из factor_stats.
+	perFactor, err := s.factorStatsAggregate(ctx)
+	if err != nil {
+		log.Printf("server: агрегация factor_stats: %v", err)
+		perFactor = []model.FactorHitRateView{}
+	}
+
+	summary := model.AccuracySummary{
+		Total:         len(items),
+		Hits:          hits,
+		Misses:        misses,
+		Neutrals:      neutrals,
+		Accuracy:      accuracyVal,
+		AvgConfidence: avgConfidence,
+		PerFactor:     perFactor,
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// factorStatsAggregate усредняет hit_rate_ema и суммирует samples по каждому
+// фактору по всем активам — для глобальной сводки точности.
+func (s *Server) factorStatsAggregate(ctx context.Context) ([]model.FactorHitRateView, error) {
+	all, err := s.factorStatsRepo.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Группируем по фактору: средневзвешенное EMA по samples + сумма samples.
+	type agg struct {
+		emaSum  float64
+		samples int
+		count   int
+	}
+	byFactor := make(map[string]*agg)
+	order := []string{} // сохраняем порядок первого появления
+	for _, st := range all {
+		a, ok := byFactor[st.Factor]
+		if !ok {
+			a = &agg{}
+			byFactor[st.Factor] = a
+			order = append(order, st.Factor)
+		}
+		a.emaSum += st.HitRateEMA
+		a.samples += st.Samples
+		a.count++
+	}
+	out := make([]model.FactorHitRateView, 0, len(order))
+	for _, factor := range order {
+		a := byFactor[factor]
+		avgEMA := 0.0
+		if a.count > 0 {
+			avgEMA = a.emaSum / float64(a.count)
+		}
+		out = append(out, model.FactorHitRateView{
+			Factor:     factor,
+			HitRateEMA: avgEMA,
+			Samples:    a.samples,
+		})
+	}
+	return out, nil
 }
 
 // forecastView собирает DTO прогноза: доменный прогноз + факторы + «использованные

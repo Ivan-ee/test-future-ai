@@ -8,6 +8,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -460,17 +461,17 @@ func (r indicatorSnapshotRow) toModel() model.IndicatorSnapshot {
 }
 
 type newsItemRow struct {
-	ID               int64          `db:"id"`
-	AssetID          sql.NullInt64  `db:"asset_id"`
-	SourceID         int64          `db:"source_id"`
-	ExternalID       string         `db:"external_id"`
-	Title            string         `db:"title"`
-	Body             string         `db:"body"`
-	Link             string         `db:"link"`
-	PublishedAt      time.Time      `db:"published_at"`
+	ID               int64           `db:"id"`
+	AssetID          sql.NullInt64   `db:"asset_id"`
+	SourceID         int64           `db:"source_id"`
+	ExternalID       string          `db:"external_id"`
+	Title            string          `db:"title"`
+	Body             string          `db:"body"`
+	Link             string          `db:"link"`
+	PublishedAt      time.Time       `db:"published_at"`
 	SentimentScore   sql.NullFloat64 `db:"sentiment_score"`
 	SentimentSummary sql.NullString  `db:"sentiment_summary"`
-	InsertedAt       time.Time      `db:"inserted_at"`
+	InsertedAt       time.Time       `db:"inserted_at"`
 }
 
 func (r newsItemRow) toModel() model.NewsItem {
@@ -619,6 +620,73 @@ ORDER BY a.id`
 	return out, nil
 }
 
+// PendingResolution возвращает прогнозы старше olderThan, у которых ещё нет outcome
+// (LEFT JOIN outcomes WHERE o.forecast_id IS NULL). Статус прогноза — active или
+// superseded: superseded-прогнозы тоже должны сверяться по достижении горизонта.
+// Это прогнозы, которые были выданы 24+ часов назад, но ещё не сверкнуты с фактом.
+func (r *Forecasts) PendingResolution(ctx context.Context, olderThan time.Time) ([]model.Forecast, error) {
+	const q = `
+SELECT f.id, f.asset_id, f.created_at, f.horizon_hours, f.direction, f.confidence,
+       f.risk_note, f.argument_text, f.raw_score, f.status
+FROM forecasts f
+LEFT JOIN outcomes o ON o.forecast_id = f.id
+WHERE o.forecast_id IS NULL
+  AND f.created_at < ?
+  AND f.status IN (?, ?)
+ORDER BY f.created_at ASC`
+	var rows []forecastRow
+	if err := r.db.SelectContext(ctx, &rows, q,
+		olderThan.UTC(),
+		string(model.ForecastStatusActive), string(model.ForecastStatusSuperseded)); err != nil {
+		return nil, fmt.Errorf("выборка прогнозов для resolve: %w", err)
+	}
+	out := make([]model.Forecast, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// SetStatus переводит прогноз в указанный статус (для resolve — в resolved).
+func (r *Forecasts) SetStatus(ctx context.Context, forecastID int64, status model.ForecastStatus) error {
+	const q = `UPDATE forecasts SET status = ? WHERE id = ?`
+	if _, err := r.db.ExecContext(ctx, q, string(status), forecastID); err != nil {
+		return fmt.Errorf("обновление статуса forecast %d: %w", forecastID, err)
+	}
+	return nil
+}
+
+// FactorsByForecast возвращает факторы прогноза по его id — для атрибуции ошибок
+// и обновления factor_stats в resolve-цикле.
+func (r *Forecasts) FactorsByForecast(ctx context.Context, forecastID int64) ([]model.ForecastFactor, error) {
+	var rows []forecastFactorRow
+	const q = `
+SELECT id, forecast_id, name, signal, base_weight, adjusted_weight, contribution, detail
+FROM forecast_factors WHERE forecast_id = ? ORDER BY id`
+	if err := r.db.SelectContext(ctx, &rows, q, forecastID); err != nil {
+		return nil, fmt.Errorf("выборка forecast_factors для forecast %d: %w", forecastID, err)
+	}
+	out := make([]model.ForecastFactor, 0, len(rows))
+	for _, fr := range rows {
+		out = append(out, fr.toModel())
+	}
+	return out, nil
+}
+
+// PriceAtTime возвращает цену актива ближайшую к моменту ts (ts или ранее) —
+// для price_at_forecast в resolve-логике. Если точек цен нет — sql.ErrNoRows.
+func (r *Forecasts) PriceAtTime(ctx context.Context, assetID int64, ts time.Time) (float64, error) {
+	const q = `
+SELECT price_usd FROM price_points
+WHERE asset_id = ? AND ts <= ?
+ORDER BY ts DESC, source_id ASC LIMIT 1`
+	var price float64
+	if err := r.db.GetContext(ctx, &price, q, assetID, ts.UTC()); err != nil {
+		return 0, fmt.Errorf("цена на момент %s для asset %d: %w", ts.UTC().Format(time.RFC3339), assetID, err)
+	}
+	return price, nil
+}
+
 // --- отображения строк БД прогнозов в доменные типы ---
 
 type forecastRow struct {
@@ -690,5 +758,258 @@ func (r forecastSummaryRow) toModel() model.ForecastSummary {
 		Direction:  r.Direction,
 		Confidence: r.Confidence,
 		CreatedAt:  r.CreatedAt,
+	}
+}
+
+// --- T5: репозитории точности (outcomes, factor_stats) ---
+
+// Outcomes — репозиторий результатов сверки прогнозов с фактом.
+type Outcomes struct{ db *sqlx.DB }
+
+func NewOutcomes(db *sqlx.DB) *Outcomes { return &Outcomes{db: db} }
+
+// Insert записывает результат сверки прогноза. INSERT OR REPLACE — на случай
+// повторного resolve (идемпотентность по forecast_id PK).
+func (r *Outcomes) Insert(ctx context.Context, o model.Outcome) error {
+	const q = `
+INSERT OR REPLACE INTO outcomes
+    (forecast_id, resolved_at, actual_direction, result, price_at_forecast,
+     price_at_resolution, price_change_pct, culprit_factor, culprit_explanation)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := r.db.ExecContext(ctx, q,
+		o.ForecastID, o.ResolvedAt.UTC(), o.ActualDirection, string(o.Result),
+		o.PriceAtForecast, o.PriceAtResolution, o.PriceChangePct,
+		o.CulpritFactor, o.CulpritExplanation)
+	if err != nil {
+		return fmt.Errorf("вставка outcome для forecast %d: %w", o.ForecastID, err)
+	}
+	return nil
+}
+
+// ExistsByForecast проверяет, есть ли уже результат сверки для прогноза.
+func (r *Outcomes) ExistsByForecast(ctx context.Context, forecastID int64) (bool, error) {
+	const q = `SELECT 1 FROM outcomes WHERE forecast_id = ? LIMIT 1`
+	var one int
+	if err := r.db.GetContext(ctx, &one, q, forecastID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("проверка outcome для forecast %d: %w", forecastID, err)
+	}
+	return true, nil
+}
+
+// ByForecast возвращает результат сверки для конкретного прогноза. Если прогноз
+// ещё не сверкнут — sql.ErrNoRows.
+func (r *Outcomes) ByForecast(ctx context.Context, forecastID int64) (model.Outcome, error) {
+	var row outcomeRow
+	const q = `
+SELECT forecast_id, resolved_at, actual_direction, result, price_at_forecast,
+       price_at_resolution, price_change_pct, culprit_factor, culprit_explanation
+FROM outcomes WHERE forecast_id = ?`
+	if err := r.db.GetContext(ctx, &row, q, forecastID); err != nil {
+		return model.Outcome{}, fmt.Errorf("выборка outcome для forecast %d: %w", forecastID, err)
+	}
+	return row.toModel(), nil
+}
+
+// outcomeRow — строка таблицы outcomes.
+type outcomeRow struct {
+	ForecastID         int64     `db:"forecast_id"`
+	ResolvedAt         time.Time `db:"resolved_at"`
+	ActualDirection    string    `db:"actual_direction"`
+	Result             string    `db:"result"`
+	PriceAtForecast    float64   `db:"price_at_forecast"`
+	PriceAtResolution  float64   `db:"price_at_resolution"`
+	PriceChangePct     float64   `db:"price_change_pct"`
+	CulpritFactor      string    `db:"culprit_factor"`
+	CulpritExplanation string    `db:"culprit_explanation"`
+}
+
+func (r outcomeRow) toModel() model.Outcome {
+	return model.Outcome{
+		ForecastID:         r.ForecastID,
+		ResolvedAt:         r.ResolvedAt,
+		ActualDirection:    r.ActualDirection,
+		Result:             model.OutcomeResult(r.Result),
+		PriceAtForecast:    r.PriceAtForecast,
+		PriceAtResolution:  r.PriceAtResolution,
+		PriceChangePct:     r.PriceChangePct,
+		CulpritFactor:      r.CulpritFactor,
+		CulpritExplanation: r.CulpritExplanation,
+	}
+}
+
+// RecentByAsset возвращает последние limit resolved-прогнозов по монете с их
+// результатами сверки — DTO для секции «История точности» в UI.
+func (r *Outcomes) RecentByAsset(ctx context.Context, assetID int64, limit int) ([]model.ForecastHistoryItem, error) {
+	const q = `
+SELECT
+    f.id               AS forecast_id,
+    f.created_at       AS created_at,
+    f.direction        AS direction,
+    f.confidence       AS confidence,
+    o.result           AS result,
+    o.culprit_factor   AS culprit_factor,
+    o.culprit_explanation AS culprit_explanation,
+    o.price_change_pct AS price_change_pct,
+    o.actual_direction AS actual_direction
+FROM outcomes o
+JOIN forecasts f ON f.id = o.forecast_id
+WHERE f.asset_id = ?
+ORDER BY o.resolved_at DESC
+LIMIT ?`
+	var rows []forecastHistoryRow
+	if err := r.db.SelectContext(ctx, &rows, q, assetID, limit); err != nil {
+		return nil, fmt.Errorf("выборка истории outcomes для asset %d: %w", assetID, err)
+	}
+	out := make([]model.ForecastHistoryItem, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// RecentAll возвращает последние limit resolved-прогнозов по всем монетам —
+// для расчёта глобальной сводки точности.
+func (r *Outcomes) RecentAll(ctx context.Context, limit int) ([]model.ForecastHistoryItem, error) {
+	const q = `
+SELECT
+    f.id               AS forecast_id,
+    f.created_at       AS created_at,
+    f.direction        AS direction,
+    f.confidence       AS confidence,
+    o.result           AS result,
+    o.culprit_factor   AS culprit_factor,
+    o.culprit_explanation AS culprit_explanation,
+    o.price_change_pct AS price_change_pct,
+    o.actual_direction AS actual_direction
+FROM outcomes o
+JOIN forecasts f ON f.id = o.forecast_id
+ORDER BY o.resolved_at DESC
+LIMIT ?`
+	var rows []forecastHistoryRow
+	if err := r.db.SelectContext(ctx, &rows, q, limit); err != nil {
+		return nil, fmt.Errorf("выборка всех outcomes: %w", err)
+	}
+	out := make([]model.ForecastHistoryItem, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// ForecastHistoryRow — строка истории прогноза с результатом сверки.
+type forecastHistoryRow struct {
+	ForecastID         int64     `db:"forecast_id"`
+	CreatedAt          time.Time `db:"created_at"`
+	Direction          string    `db:"direction"`
+	Confidence         float64   `db:"confidence"`
+	Result             string    `db:"result"`
+	CulpritFactor      string    `db:"culprit_factor"`
+	CulpritExplanation string    `db:"culprit_explanation"`
+	PriceChangePct     float64   `db:"price_change_pct"`
+	ActualDirection    string    `db:"actual_direction"`
+}
+
+func (r forecastHistoryRow) toModel() model.ForecastHistoryItem {
+	return model.ForecastHistoryItem{
+		ForecastID:         r.ForecastID,
+		CreatedAt:          r.CreatedAt,
+		Direction:          r.Direction,
+		Confidence:         r.Confidence,
+		Result:             model.OutcomeResult(r.Result),
+		CulpritFactor:      r.CulpritFactor,
+		CulpritExplanation: r.CulpritExplanation,
+		PriceChangePct:     r.PriceChangePct,
+		ActualDirection:    r.ActualDirection,
+	}
+}
+
+// FactorStats — репозиторий скользящей статистики точности факторов.
+type FactorStats struct{ db *sqlx.DB }
+
+func NewFactorStats(db *sqlx.DB) *FactorStats { return &FactorStats{db: db} }
+
+// Get возвращает статистику фактора по монете. Если записи нет — возвращает
+// значения по умолчанию (hit_rate_ema=0.5, samples=0) без ошибки.
+func (r *FactorStats) Get(ctx context.Context, assetID int64, factor string) (model.FactorStat, error) {
+	var row factorStatRow
+	const q = `
+SELECT asset_id, factor, hit_rate_ema, samples, updated_at
+FROM factor_stats WHERE asset_id = ? AND factor = ?`
+	if err := r.db.GetContext(ctx, &row, q, assetID, factor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Нет данных — нейтральное значение по умолчанию.
+			return model.FactorStat{AssetID: assetID, Factor: factor, HitRateEMA: 0.5, Samples: 0}, nil
+		}
+		return model.FactorStat{}, fmt.Errorf("выборка factor_stats (%d, %s): %w", assetID, factor, err)
+	}
+	return row.toModel(), nil
+}
+
+// ByAsset возвращает статистику всех факторов по монете. Факторы без записи
+// в БД сюда не попадают (адаптация для них берёт дефолт через Get).
+func (r *FactorStats) ByAsset(ctx context.Context, assetID int64) ([]model.FactorStat, error) {
+	var rows []factorStatRow
+	const q = `
+SELECT asset_id, factor, hit_rate_ema, samples, updated_at
+FROM factor_stats WHERE asset_id = ?`
+	if err := r.db.SelectContext(ctx, &rows, q, assetID); err != nil {
+		return nil, fmt.Errorf("выборка factor_stats для asset %d: %w", assetID, err)
+	}
+	out := make([]model.FactorStat, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// All возвращает всю статистику факторов (для глобальной сводки).
+func (r *FactorStats) All(ctx context.Context) ([]model.FactorStat, error) {
+	var rows []factorStatRow
+	const q = `SELECT asset_id, factor, hit_rate_ema, samples, updated_at FROM factor_stats`
+	if err := r.db.SelectContext(ctx, &rows, q); err != nil {
+		return nil, fmt.Errorf("выборка всех factor_stats: %w", err)
+	}
+	out := make([]model.FactorStat, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// Upsert обновляет или вставляет статистику фактора по монете.
+func (r *FactorStats) Upsert(ctx context.Context, stat model.FactorStat) error {
+	const q = `
+INSERT INTO factor_stats (asset_id, factor, hit_rate_ema, samples, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(asset_id, factor) DO UPDATE SET
+    hit_rate_ema = excluded.hit_rate_ema,
+    samples      = excluded.samples,
+    updated_at   = excluded.updated_at`
+	_, err := r.db.ExecContext(ctx, q,
+		stat.AssetID, stat.Factor, stat.HitRateEMA, stat.Samples, stat.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("upsert factor_stats (%d, %s): %w", stat.AssetID, stat.Factor, err)
+	}
+	return nil
+}
+
+type factorStatRow struct {
+	AssetID    int64     `db:"asset_id"`
+	Factor     string    `db:"factor"`
+	HitRateEMA float64   `db:"hit_rate_ema"`
+	Samples    int       `db:"samples"`
+	UpdatedAt  time.Time `db:"updated_at"`
+}
+
+func (r factorStatRow) toModel() model.FactorStat {
+	return model.FactorStat{
+		AssetID:    r.AssetID,
+		Factor:     r.Factor,
+		HitRateEMA: r.HitRateEMA,
+		Samples:    r.Samples,
+		UpdatedAt:  r.UpdatedAt,
 	}
 }

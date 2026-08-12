@@ -46,10 +46,10 @@ type AIClient interface {
 // Service координирует батчевую оценку сентимента: читает неотсентиченные
 // новости, вызывает AIClient, пишет результат в БД с кэшем по хэшу текста.
 type Service struct {
-	client AIClient
-	store  *storage.NewsItems
-	mu     sync.RWMutex
-	cache  map[string]ScoreResult // hash(title+body) → результат
+	client  AIClient
+	store   *storage.NewsItems
+	mu      sync.RWMutex
+	cache   map[string]ScoreResult // hash(title+body) → результат
 	enabled bool
 }
 

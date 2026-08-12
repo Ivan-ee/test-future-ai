@@ -13,6 +13,12 @@
 // и батчевая оценка сентимента через OpenAI. В прогноз добавлен 4-й фактор
 // sentiment (средний сентимент новостей по монете за 24ч). Без OPENAI_API_KEY
 // прогноз работает на 3 факторах (graceful degradation).
+//
+// T5: отдельный resolve-цикл (раз в час) находит прогнозы старше 24ч без outcome,
+// сверяет направление с фактической ценой, фиксирует hit/miss/neutral, находит
+// «виновный» фактор (атрибуция) и обновляет factor_stats.hit_rate_ema. При расчёте
+// новых прогнозов веса факторов адаптируются: adjusted_weight = base × clamp(ema/0.5,
+// 0.5, 1.5) — фактор, что часто ошибается, получает понижение.
 package worker
 
 import (
@@ -21,6 +27,7 @@ import (
 	"log"
 	"time"
 
+	"test-future/internal/accuracy"
 	"test-future/internal/config"
 	"test-future/internal/indicator"
 	"test-future/internal/model"
@@ -58,22 +65,30 @@ const (
 	sentimentBatchLimit = 20
 	// sentimentWindow — период для среднего сентимента по монете.
 	sentimentWindow = 24 * time.Hour
+	// resolveInterval — период resolve-цикла (сверка прогнозов с фактом).
+	resolveInterval = time.Hour
+	// forecastHorizon — горизонт прогноза; прогнозы старше этого возраста подлежат resolve.
+	forecastHorizon = 24 * time.Hour
+	// accuracyHistoryLimit — сколько прогнозов в истории точности по монете для UI.
+	accuracyHistoryLimit = 20
 )
 
 // Worker — фоновый опросник источников.
 type Worker struct {
-	cfg            config.Config
-	taker          CoinGeckoTaker
-	newsTaker      coinpaprika.NewsTaker // новости CoinPaprika
-	rssTaker       rss.NewsTaker         // новости RSS (CoinDesk/Cointelegraph)
-	assets         *storage.Assets
-	sources        *storage.Sources
-	priceStore     *storage.PricePoints
-	logStore       *storage.UpdateLog
-	indicatorStore *storage.IndicatorSnapshots
-	forecastStore  *storage.Forecasts
-	newsStore      *storage.NewsItems
-	sentiment      *sentiment.Service
+	cfg             config.Config
+	taker           CoinGeckoTaker
+	newsTaker       coinpaprika.NewsTaker // новости CoinPaprika
+	rssTaker        rss.NewsTaker         // новости RSS (CoinDesk/Cointelegraph)
+	assets          *storage.Assets
+	sources         *storage.Sources
+	priceStore      *storage.PricePoints
+	logStore        *storage.UpdateLog
+	indicatorStore  *storage.IndicatorSnapshots
+	forecastStore   *storage.Forecasts
+	newsStore       *storage.NewsItems
+	sentiment       *sentiment.Service
+	outcomeStore    *storage.Outcomes    // T5: результаты сверки прогнозов
+	factorStatsRepo *storage.FactorStats // T5: статистика точности факторов
 }
 
 // New создаёт worker с реальными клиентами источников.
@@ -87,6 +102,8 @@ func New(
 	forecastStore *storage.Forecasts,
 	newsStore *storage.NewsItems,
 	sentimentSvc *sentiment.Service,
+	outcomeStore *storage.Outcomes,
+	factorStatsRepo *storage.FactorStats,
 ) *Worker {
 	return NewWithTakers(
 		cfg,
@@ -94,7 +111,7 @@ func New(
 		coinpaprika.New(cfg.CoinPaprikaBaseURL),
 		rss.New(),
 		assets, sources, priceStore, logStore, indicatorStore, forecastStore,
-		newsStore, sentimentSvc,
+		newsStore, sentimentSvc, outcomeStore, factorStatsRepo,
 	)
 }
 
@@ -112,41 +129,50 @@ func NewWithTakers(
 	forecastStore *storage.Forecasts,
 	newsStore *storage.NewsItems,
 	sentimentSvc *sentiment.Service,
+	outcomeStore *storage.Outcomes,
+	factorStatsRepo *storage.FactorStats,
 ) *Worker {
 	return &Worker{
-		cfg:            cfg,
-		taker:          taker,
-		newsTaker:      newsTaker,
-		rssTaker:       rssTaker,
-		assets:         assets,
-		sources:        sources,
-		priceStore:     priceStore,
-		logStore:       logStore,
-		indicatorStore: indicatorStore,
-		forecastStore:  forecastStore,
-		newsStore:      newsStore,
-		sentiment:      sentimentSvc,
+		cfg:             cfg,
+		taker:           taker,
+		newsTaker:       newsTaker,
+		rssTaker:        rssTaker,
+		assets:          assets,
+		sources:         sources,
+		priceStore:      priceStore,
+		logStore:        logStore,
+		indicatorStore:  indicatorStore,
+		forecastStore:   forecastStore,
+		newsStore:       newsStore,
+		sentiment:       sentimentSvc,
+		outcomeStore:    outcomeStore,
+		factorStatsRepo: factorStatsRepo,
 	}
 }
 
 // Run блокирует до отмены ctx, опрашивая источник по расписанию.
 // Первый опрос выполняется сразу (чтобы UI показал данные без ожидания).
-// Отдельным тикером раз в forecastInterval пересчитываются прогнозы.
+// Отдельным тикером раз в forecastInterval пересчитываются прогнозы, а раз в
+// resolveInterval сверяются прогнозы старше 24ч с фактом (resolve-цикл T5).
 func (w *Worker) Run(ctx context.Context) {
 	interval := time.Duration(w.cfg.FetchIntervalMin) * time.Minute
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	log.Printf("worker: запуск, интервал опроса %v, прогнозов — %v", interval, forecastInterval)
+	log.Printf("worker: запуск, интервал опроса %v, прогнозов — %v, resolve — %v",
+		interval, forecastInterval, resolveInterval)
 
-	// Сразу — один цикл цен/индикаторов/новостей/сентимента, затем прогноз.
+	// Сразу — один цикл цен/индикаторов/новостей/сентимента, затем прогноз и resolve.
 	w.fetchOnce(ctx)
 	w.computeForecasts(ctx)
+	w.resolveOnce(ctx)
 
 	priceTicker := time.NewTicker(interval)
 	forecastTicker := time.NewTicker(forecastInterval)
+	resolveTicker := time.NewTicker(resolveInterval)
 	defer priceTicker.Stop()
 	defer forecastTicker.Stop()
+	defer resolveTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -156,6 +182,8 @@ func (w *Worker) Run(ctx context.Context) {
 			w.fetchOnce(ctx)
 		case <-forecastTicker.C:
 			w.computeForecasts(ctx)
+		case <-resolveTicker.C:
+			w.resolveOnce(ctx)
 		}
 	}
 }
@@ -459,7 +487,12 @@ func (w *Worker) computeOneForecast(ctx context.Context, asset model.Asset) erro
 		sentimentScore = *avgSentiment
 	}
 	factors := scoring.FactorsFromIndicatorsAndSentiment(in, sentimentScore, hasSentiment, indicator.DefaultVolumeTolerance)
-	result := scoring.Forecast(factors, nil)
+
+	// T5: адаптация весов — на основе factor_stats.hit_rate_ema считаем adjusted
+	// веса (base × clamp(ema/0.5, 0.5, 1.5)) и передаём в scoring.Forecast для
+	// перенормировки. Фактор без статистики использует EMA=0.5 (множитель 1.0).
+	adjustedWeights := w.adaptedWeights(ctx, asset.ID, factors)
+	result := scoring.Forecast(factors, adjustedWeights)
 
 	// Собираем доменную модель для сохранения.
 	now := time.Now().UTC()
@@ -490,4 +523,142 @@ func (w *Worker) computeOneForecast(ctx context.Context, asset model.Asset) erro
 		return fmt.Errorf("сохранение прогноза asset %d: %w", asset.ID, err)
 	}
 	return nil
+}
+
+// adaptedWeights строит map фактор → адаптированный базовый вес на основе
+// factor_stats.hit_rate_ema. Факторам без статистики — дефолтный base_weight.
+// Возвращаемый map передаётся в scoring.Forecast как weights (нормировка идёт
+// внутри scoring по сумме этих весов).
+func (w *Worker) adaptedWeights(ctx context.Context, assetID int64, factors []scoring.Factor) map[scoring.FactorName]float64 {
+	weights := make(map[scoring.FactorName]float64, len(factors))
+	for _, f := range factors {
+		base := scoring.DefaultBaseWeights[f.Name] // исходный вес из спеки T3/T4
+
+		// T5: корректируем вес на основе hit_rate_ema этого фактора по монете.
+		stat, err := w.factorStatsRepo.Get(ctx, assetID, string(f.Name))
+		if err != nil {
+			log.Printf("worker: factor_stats для %s asset %d: %v — использую base", f.Name, assetID, err)
+			weights[f.Name] = base
+			continue
+		}
+		weights[f.Name] = accuracy.AdjustedWeight(base, stat.HitRateEMA)
+	}
+	return weights
+}
+
+// resolveOnce находит прогнозы старше 24ч без outcome, сверяет их с фактом,
+// фиксирует результат, атрибуцию и обновляет factor_stats. Ошибка на одном
+// прогнозе не валит весь цикл.
+func (w *Worker) resolveOnce(ctx context.Context) {
+	cutoff := time.Now().UTC().Add(-forecastHorizon)
+	pending, err := w.forecastStore.PendingResolution(ctx, cutoff)
+	if err != nil {
+		log.Printf("worker: resolve — выборка прогнозов: %v", err)
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	resolved := 0
+	for _, fc := range pending {
+		if err := w.resolveOne(ctx, fc); err != nil {
+			log.Printf("worker: resolve прогноза %d: %v", fc.ID, err)
+			continue
+		}
+		resolved++
+	}
+	log.Printf("worker: resolve — сверено прогнозов: %d (из %d)", resolved, len(pending))
+}
+
+// resolveOne сверяет один прогноз с фактом: берёт цены на момент прогноза и
+// сейчас, считает результат, атрибуцию, пишет outcome и обновляет factor_stats.
+func (w *Worker) resolveOne(ctx context.Context, fc model.Forecast) error {
+	// Цена на момент прогноза — ближайшая точка ≤ created_at.
+	priceAtForecast, err := w.forecastStore.PriceAtTime(ctx, fc.AssetID, fc.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("цена на момент прогноза: %w", err)
+	}
+
+	// Текущая цена — последняя точка актива.
+	priceAtResolution, err := w.lastPrice(ctx, fc.AssetID)
+	if err != nil {
+		return fmt.Errorf("текущая цена: %w", err)
+	}
+
+	result, changePct, actualDir := accuracy.Resolve(fc.Direction, priceAtForecast, priceAtResolution)
+
+	// Факторы прогноза — для атрибуции и обновления статистики.
+	factors, err := w.forecastStore.FactorsByForecast(ctx, fc.ID)
+	if err != nil {
+		return fmt.Errorf("факторы прогноза %d: %w", fc.ID, err)
+	}
+
+	// Атрибуция: при miss — виновный фактор, при hit — ведущий.
+	culprit, explanation := "", ""
+	switch result {
+	case model.OutcomeMiss:
+		culprit, explanation = accuracy.AttributeMiss(factors, actualDir)
+	case model.OutcomeHit:
+		culprit, explanation = accuracy.AttributeHit(factors, actualDir)
+	}
+
+	// Записываем outcome.
+	outcome := model.Outcome{
+		ForecastID:         fc.ID,
+		ResolvedAt:         time.Now().UTC(),
+		ActualDirection:    actualDir,
+		Result:             result,
+		PriceAtForecast:    priceAtForecast,
+		PriceAtResolution:  priceAtResolution,
+		PriceChangePct:     changePct,
+		CulpritFactor:      culprit,
+		CulpritExplanation: explanation,
+	}
+	if err := w.outcomeStore.Insert(ctx, outcome); err != nil {
+		return fmt.Errorf("запись outcome: %w", err)
+	}
+
+	// Переводим прогноз в resolved (терминальный статус для аудит-истории).
+	if err := w.forecastStore.SetStatus(ctx, fc.ID, model.ForecastStatusResolved); err != nil {
+		return fmt.Errorf("обновление статуса прогноза: %w", err)
+	}
+
+	// Обновляем factor_stats по каждому фактору прогноза. Neutral не учитываем —
+	// слишком маленькое движение (<0.5%) не несёт информации для обучения весов.
+	w.updateFactorStats(ctx, fc.AssetID, factors, actualDir, result)
+
+	return nil
+}
+
+// updateFactorStats обновляет hit_rate_ema для каждого фактора прогноза на основе
+// совпадения знака его сигнала с actual_direction. При neutral обновление пропускается
+// (движение цены слишком маленькое, чтобы служить сигналом для обучения).
+func (w *Worker) updateFactorStats(ctx context.Context, assetID int64, factors []model.ForecastFactor, actualDir string, result model.OutcomeResult) {
+	if result == model.OutcomeNeutral {
+		return
+	}
+	for _, f := range factors {
+		stat, err := w.factorStatsRepo.Get(ctx, assetID, f.Name)
+		if err != nil {
+			log.Printf("worker: factor_stats get (%s, %d): %v", f.Name, assetID, err)
+			continue
+		}
+		newEMA, _ := accuracy.UpdateHitRateEMA(stat.HitRateEMA, f.Signal, actualDir)
+		stat.HitRateEMA = newEMA
+		stat.Samples++
+		stat.UpdatedAt = time.Now().UTC()
+		if err := w.factorStatsRepo.Upsert(ctx, stat); err != nil {
+			log.Printf("worker: factor_stats upsert (%s, %d): %v", f.Name, assetID, err)
+		}
+	}
+}
+
+// lastPrice возвращает последнюю цену актива из price_points.
+func (w *Worker) lastPrice(ctx context.Context, assetID int64) (float64, error) {
+	price, err := w.priceStore.LatestByAssetID(ctx, assetID)
+	if err != nil {
+		return 0, err
+	}
+	return price.PriceUSD, nil
 }
