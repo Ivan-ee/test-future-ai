@@ -8,6 +8,11 @@
 // T3: отдельный цикл прогноза (раз в час) читает индикаторы, считает прогноз
 // «вверх/вниз за 24ч» через scoring.Forecast и сохраняет результат + декомпозицию
 // по факторам в forecasts / forecast_factors.
+//
+// T4: в цикл опроса добавлена загрузка новостей (CoinPaprika + RSS) в news_items
+// и батчевая оценка сентимента через OpenAI. В прогноз добавлен 4-й фактор
+// sentiment (средний сентимент новостей по монете за 24ч). Без OPENAI_API_KEY
+// прогноз работает на 3 факторах (graceful degradation).
 package worker
 
 import (
@@ -20,7 +25,10 @@ import (
 	"test-future/internal/indicator"
 	"test-future/internal/model"
 	"test-future/internal/scoring"
+	"test-future/internal/sentiment"
 	"test-future/internal/source/coingecko"
+	"test-future/internal/source/coinpaprika"
+	"test-future/internal/source/rss"
 	"test-future/internal/storage"
 )
 
@@ -44,21 +52,31 @@ const (
 	closesWindow = 30
 	// forecastInterval — период пересчёта прогнозов. По спеке T3 — раз в час.
 	forecastInterval = time.Hour
+	// newsLimit — сколько новостей тянуть за один запрос из CoinPaprika.
+	newsLimit = 20
+	// sentimentBatchLimit — сколько неотсентиченных новостей обрабатывать за цикл.
+	sentimentBatchLimit = 20
+	// sentimentWindow — период для среднего сентимента по монете.
+	sentimentWindow = 24 * time.Hour
 )
 
 // Worker — фоновый опросник источников.
 type Worker struct {
 	cfg            config.Config
 	taker          CoinGeckoTaker
+	newsTaker      coinpaprika.NewsTaker // новости CoinPaprika
+	rssTaker       rss.NewsTaker         // новости RSS (CoinDesk/Cointelegraph)
 	assets         *storage.Assets
 	sources        *storage.Sources
 	priceStore     *storage.PricePoints
 	logStore       *storage.UpdateLog
 	indicatorStore *storage.IndicatorSnapshots
 	forecastStore  *storage.Forecasts
+	newsStore      *storage.NewsItems
+	sentiment      *sentiment.Service
 }
 
-// New создаёт worker с реальным клиентом CoinGecko.
+// New создаёт worker с реальными клиентами источников.
 func New(
 	cfg config.Config,
 	assets *storage.Assets,
@@ -67,30 +85,47 @@ func New(
 	logStore *storage.UpdateLog,
 	indicatorStore *storage.IndicatorSnapshots,
 	forecastStore *storage.Forecasts,
+	newsStore *storage.NewsItems,
+	sentimentSvc *sentiment.Service,
 ) *Worker {
-	return NewWithTaker(cfg, coingecko.New(cfg.CoinGeckoBaseURL), assets, sources, priceStore, logStore, indicatorStore, forecastStore)
+	return NewWithTakers(
+		cfg,
+		coingecko.New(cfg.CoinGeckoBaseURL),
+		coinpaprika.New(cfg.CoinPaprikaBaseURL),
+		rss.New(),
+		assets, sources, priceStore, logStore, indicatorStore, forecastStore,
+		newsStore, sentimentSvc,
+	)
 }
 
-// NewWithTaker позволяет внедрить тестовую/моковую реализацию источника.
-func NewWithTaker(
+// NewWithTakers позволяет внедрить тестовые/моковые реализации источников.
+func NewWithTakers(
 	cfg config.Config,
 	taker CoinGeckoTaker,
+	newsTaker coinpaprika.NewsTaker,
+	rssTaker rss.NewsTaker,
 	assets *storage.Assets,
 	sources *storage.Sources,
 	priceStore *storage.PricePoints,
 	logStore *storage.UpdateLog,
 	indicatorStore *storage.IndicatorSnapshots,
 	forecastStore *storage.Forecasts,
+	newsStore *storage.NewsItems,
+	sentimentSvc *sentiment.Service,
 ) *Worker {
 	return &Worker{
 		cfg:            cfg,
 		taker:          taker,
+		newsTaker:      newsTaker,
+		rssTaker:       rssTaker,
 		assets:         assets,
 		sources:        sources,
 		priceStore:     priceStore,
 		logStore:       logStore,
 		indicatorStore: indicatorStore,
 		forecastStore:  forecastStore,
+		newsStore:      newsStore,
+		sentiment:      sentimentSvc,
 	}
 }
 
@@ -104,7 +139,7 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	log.Printf("worker: запуск, интервал опроса %v, прогнозов — %v", interval, forecastInterval)
 
-	// Сразу — один цикл цен/индикаторов, затем прогноз (нужны свежие индикаторы).
+	// Сразу — один цикл цен/индикаторов/новостей/сентимента, затем прогноз.
 	w.fetchOnce(ctx)
 	w.computeForecasts(ctx)
 
@@ -179,8 +214,111 @@ func (w *Worker) fetchOnce(ctx context.Context) {
 		}
 	}
 
+	// T4: новости из CoinPaprika + RSS и оценка сентимента.
+	w.fetchNews(ctx)
+	w.scoreNews(ctx)
+
 	w.logCycle(ctx, started, model.UpdateStatusOK, added, nil)
 	log.Printf("worker: цикл CoinGecko завершён, добавлено новых точек: %d", added)
+}
+
+// fetchNews тянет новости из всех источников (CoinPaprika + RSS) и пишет их в
+// news_items с дедупом. Каждый источник логируется отдельно в update_log.
+func (w *Worker) fetchNews(ctx context.Context) {
+	byID, err := w.assets.MapByCoinID(ctx)
+	if err != nil {
+		log.Printf("worker: новости — выборка assets: %v", err)
+		return
+	}
+
+	// CoinPaprika: один запрос на все монеты.
+	if err := w.fetchCoinPaprikaNews(ctx, byID); err != nil {
+		log.Printf("worker: новости CoinPaprika: %v", err)
+	}
+
+	// RSS: по одной ленте на источник.
+	for _, slug := range []string{rss.SlugCoindesk, rss.SlugCointelegraph} {
+		if err := w.fetchRSSNews(ctx, slug); err != nil {
+			log.Printf("worker: новости %s: %v", slug, err)
+		}
+	}
+}
+
+// fetchCoinPaprikaNews тянет новости CoinPaprika, связывает с монетами и пишет в БД.
+func (w *Worker) fetchCoinPaprikaNews(ctx context.Context, byID map[string]model.Asset) error {
+	src, err := w.sources.BySlug(ctx, coinpaprika.SourceSlug)
+	if err != nil {
+		return fmt.Errorf("источник %s не найден: %w", coinpaprika.SourceSlug, err)
+	}
+
+	// Слаги CoinPaprika для отслеживаемых монет — единый источник правды в пакете.
+	coinIDs := make([]string, 0, len(byID))
+	for id := range byID {
+		coinIDs = append(coinIDs, id)
+	}
+	slugs := coinpaprika.SlugsForCoinIDs(coinIDs)
+	if len(slugs) == 0 {
+		return nil
+	}
+
+	raw, err := w.newsTaker.News(ctx, slugs, newsLimit)
+	if err != nil {
+		return fmt.Errorf("запрос новостей: %w", err)
+	}
+
+	items := coinpaprika.NewsMap(raw, byID, src.ID)
+	added, err := w.newsStore.InsertMany(ctx, items)
+	if err != nil {
+		return fmt.Errorf("вставка новостей: %w", err)
+	}
+	log.Printf("worker: новости CoinPaprika — добавлено новых: %d (из %d)", added, len(items))
+	return nil
+}
+
+// fetchRSSNews тянет одну RSS-ленту и пишет новости в БД.
+func (w *Worker) fetchRSSNews(ctx context.Context, slug string) error {
+	src, err := w.sources.BySlug(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("источник %s не найден: %w", slug, err)
+	}
+
+	raw, err := w.rssTaker.News(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("парсинг ленты: %w", err)
+	}
+
+	items := rss.NewsMap(raw, src.ID)
+	added, err := w.newsStore.InsertMany(ctx, items)
+	if err != nil {
+		return fmt.Errorf("вставка новостей: %w", err)
+	}
+	log.Printf("worker: новости %s — добавлено новых: %d (из %d)", slug, added, len(items))
+	return nil
+}
+
+// scoreNews берёт батч неотсентиченных новостей и оценивает их сентимент через
+// OpenAI. Если сервис выключен (нет API-ключа) — тихо пропускает (предупреждение
+// уже выведено один раз при старте в main.go).
+func (w *Worker) scoreNews(ctx context.Context) {
+	if !w.sentiment.Enabled() {
+		return
+	}
+
+	items, err := w.newsStore.Unscored(ctx, sentimentBatchLimit)
+	if err != nil {
+		log.Printf("worker: сентимент — выборка новостей: %v", err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+
+	scored, err := w.sentiment.ScoreBatch(ctx, items)
+	if err != nil {
+		log.Printf("worker: сентимент — ошибка батча: %v", err)
+		return
+	}
+	log.Printf("worker: сентимент — оценено новостей: %d (из %d)", scored, len(items))
 }
 
 // fetchChartAndIndicators тянет рыночный график монеты за chartDays дней,
@@ -311,7 +449,16 @@ func (w *Worker) computeOneForecast(ctx context.Context, asset model.Asset) erro
 		SMA20:        snap.SMA20,
 		VolumeSignal: snap.VolumeSignal,
 	}
-	factors := scoring.FactorsFromIndicators(in, indicator.DefaultVolumeTolerance)
+
+	// T4: средний сентимент новостей по монете за 24ч → 4-й фактор (если есть).
+	since := time.Now().UTC().Add(-sentimentWindow)
+	avgSentiment, err := w.newsStore.AvgSentimentByAsset(ctx, asset.ID, since)
+	hasSentiment := err == nil && avgSentiment != nil
+	sentimentScore := 0.0
+	if hasSentiment {
+		sentimentScore = *avgSentiment
+	}
+	factors := scoring.FactorsFromIndicatorsAndSentiment(in, sentimentScore, hasSentiment, indicator.DefaultVolumeTolerance)
 	result := scoring.Forecast(factors, nil)
 
 	// Собираем доменную модель для сохранения.

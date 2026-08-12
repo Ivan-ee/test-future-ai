@@ -16,12 +16,13 @@ import (
 
 // Config — конфигурация приложения.
 type Config struct {
-	OpenAIAPIKey     string
-	CoinGeckoBaseURL string
-	BackendPort      int
-	FrontendPort     int
-	DBPath           string
-	FetchIntervalMin int // период опроса источников, минут (по умолчанию 10)
+	OpenAIAPIKey       string
+	CoinGeckoBaseURL   string
+	CoinPaprikaBaseURL string
+	BackendPort        int
+	FrontendPort       int
+	DBPath             string
+	FetchIntervalMin   int // период опроса источников, минут (по умолчанию 10)
 }
 
 // Load загружает конфигурацию: сначала пробует .env в корне репозитория, затем
@@ -31,10 +32,11 @@ func Load() (Config, error) {
 	_ = godotenv.Load()
 
 	cfg := Config{
-		OpenAIAPIKey:     getenv("OPENAI_API_KEY", ""),
-		CoinGeckoBaseURL: getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
-		DBPath:           getenv("DB_PATH", "data/testfuture.db"),
-		FetchIntervalMin: getenvInt("FETCH_INTERVAL_MIN", 10),
+		OpenAIAPIKey:       getenv("OPENAI_API_KEY", ""),
+		CoinGeckoBaseURL:   getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
+		CoinPaprikaBaseURL: getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1"),
+		DBPath:             getenv("DB_PATH", "data/testfuture.db"),
+		FetchIntervalMin:   getenvInt("FETCH_INTERVAL_MIN", 10),
 	}
 	cfg.BackendPort = getenvInt("BACKEND_PORT", 8081)
 	cfg.FrontendPort = getenvInt("FRONTEND_PORT", 3001)

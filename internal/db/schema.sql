@@ -102,3 +102,26 @@ CREATE TABLE IF NOT EXISTS forecast_factors (
 
 CREATE INDEX IF NOT EXISTS idx_forecast_factors_forecast
     ON forecast_factors (forecast_id);
+
+-- Новости из внешних источников (T4): CoinPaprika и RSS (CoinDesk/Cointelegraph).
+-- Дедуп — по уникальному ключу (source_id, external_id). Сентимент проставляется
+-- позже через OpenAI (nullable до оценки).
+CREATE TABLE IF NOT EXISTS news_items (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id          INTEGER REFERENCES assets(id),     -- nullable: связь с монетой
+    source_id         INTEGER NOT NULL REFERENCES sources(id),
+    external_id       TEXT    NOT NULL,                  -- идентификатор у источника
+    title             TEXT    NOT NULL DEFAULT '',
+    body              TEXT    NOT NULL DEFAULT '',
+    link              TEXT    NOT NULL DEFAULT '',
+    published_at      DATETIME NOT NULL,
+    sentiment_score   REAL,                              -- nullable: -1..1
+    sentiment_summary TEXT,                              -- nullable: короткое резюме
+    inserted_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (source_id, external_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_items_asset_published
+    ON news_items (asset_id, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_news_items_unscored
+    ON news_items (source_id) WHERE sentiment_score IS NULL;

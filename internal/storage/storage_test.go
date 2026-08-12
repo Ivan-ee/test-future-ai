@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -302,5 +304,239 @@ func TestIndicatorSnapshots_ByAssetNotFound(t *testing.T) {
 	_, err := repo.ByAsset(ctx, 999)
 	if err == nil {
 		t.Fatal("ожидали ошибку для несуществующего снапшота")
+	}
+}
+
+// --- T4: репозиторий NewsItems ---
+
+// makeNewsItem — помощник: создаёт NewsItem с заданным external_id и asset_id=1.
+func makeNewsItem(externalID string, assetID int64) model.NewsItem {
+	var aid *int64
+	if assetID > 0 {
+		aid = &assetID
+	}
+	pub := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	return model.NewsItem{
+		AssetID:     aid,
+		SourceID:    2, // coinpaprika из сидинга
+		ExternalID:  externalID,
+		Title:       "Test news " + externalID,
+		Body:        "Body of " + externalID,
+		Link:        "https://example.com/" + externalID,
+		PublishedAt: pub,
+	}
+}
+
+// TestNewsItems_InsertMany_Dedup — повторная вставка той же новости (source_id +
+// external_id) игнорируется.
+func TestNewsItems_InsertMany_Dedup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	items := []model.NewsItem{makeNewsItem("n1", 1), makeNewsItem("n2", 1)}
+
+	added, err := repo.InsertMany(ctx, items)
+	if err != nil {
+		t.Fatalf("первая вставка: %v", err)
+	}
+	if added != 2 {
+		t.Fatalf("хотели 2 добавленных, получили %d", added)
+	}
+
+	// Повтор — дедуп.
+	added, err = repo.InsertMany(ctx, items)
+	if err != nil {
+		t.Fatalf("повторная вставка: %v", err)
+	}
+	if added != 0 {
+		t.Errorf("повтор: хотели 0 добавленных (дедуп), получили %d", added)
+	}
+
+	var n int
+	if err := d.GetContext(ctx, &n, `SELECT COUNT(*) FROM news_items`); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("хотели 2 строки, получили %d", n)
+	}
+}
+
+// TestNewsItems_Unscored — неотсентиченные новости выбираются по ORDER BY inserted_at.
+func TestNewsItems_Unscored(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	if _, err := repo.InsertMany(ctx, []model.NewsItem{
+		makeNewsItem("n1", 1), makeNewsItem("n2", 1), makeNewsItem("n3", 1),
+	}); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	// Сентимим одну — она не должна попасть в Unscored.
+	if err := repo.SetSentiment(ctx, 1, 0.5, "позитив"); err != nil {
+		t.Fatalf("SetSentiment: %v", err)
+	}
+
+	items, err := repo.Unscored(ctx, 10)
+	if err != nil {
+		t.Fatalf("Unscored: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("хотели 2 неотсентиченные, получили %d", len(items))
+	}
+}
+
+// TestNewsItems_SetSentiment_ClampsScore — score зажимается в [-1..1].
+func TestNewsItems_SetSentiment_ClampsScore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	if _, err := repo.InsertMany(ctx, []model.NewsItem{makeNewsItem("n1", 1)}); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	if err := repo.SetSentiment(ctx, 1, 5.0, "слишком позитивно"); err != nil {
+		t.Fatalf("SetSentiment: %v", err)
+	}
+
+	var score float64
+	if err := d.GetContext(ctx, &score, `SELECT sentiment_score FROM news_items WHERE id=1`); err != nil {
+		t.Fatalf("select score: %v", err)
+	}
+	if score != 1.0 {
+		t.Errorf("хотели score зажатый до 1.0, получили %v", score)
+	}
+}
+
+// TestNewsItems_RecentByAsset — последние новости по монете за период, по убыванию даты.
+func TestNewsItems_RecentByAsset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	items := make([]model.NewsItem, 3)
+	for i := range 3 {
+		n := makeNewsItem("n"+strconv.Itoa(i), 1)
+		n.PublishedAt = base.Add(time.Duration(i) * time.Hour)
+		items[i] = n
+	}
+	if _, err := repo.InsertMany(ctx, items); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	got, err := repo.RecentByAsset(ctx, 1, base, 10)
+	if err != nil {
+		t.Fatalf("RecentByAsset: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("хотели 3 новости, получили %d", len(got))
+	}
+	// По убыванию: n2 (последняя по времени) → первая.
+	if got[0].ExternalID != "n2" {
+		t.Errorf("первая новость: хотели n2, получили %s", got[0].ExternalID)
+	}
+}
+
+// TestNewsItems_RecentByAsset_FiltersBySince — новости старше since не возвращаются.
+func TestNewsItems_RecentByAsset_FiltersBySince(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	base := time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC)
+	items := []model.NewsItem{
+		func() model.NewsItem { n := makeNewsItem("old", 1); n.PublishedAt = base.Add(-2 * time.Hour); return n }(),
+		func() model.NewsItem { n := makeNewsItem("new", 1); n.PublishedAt = base; return n }(),
+	}
+	if _, err := repo.InsertMany(ctx, items); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	got, err := repo.RecentByAsset(ctx, 1, base.Add(-1*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("RecentByAsset: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("хотели 1 новость (моложе since), получили %d", len(got))
+	}
+	if got[0].ExternalID != "new" {
+		t.Errorf("хотели news=new, получили %s", got[0].ExternalID)
+	}
+}
+
+// TestNewsItems_AvgSentimentByAsset — средний сентимент по новостям с проставленным score.
+//_nil если нет оценённых новостей.
+func TestNewsItems_AvgSentimentByAsset(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	if _, err := repo.InsertMany(ctx, []model.NewsItem{
+		makeNewsItem("n1", 1), makeNewsItem("n2", 1), makeNewsItem("n3", 1),
+	}); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	// Нет оценённых → nil.
+	avg, err := repo.AvgSentimentByAsset(ctx, 1, time.Time{})
+	if err != nil {
+		t.Fatalf("AvgSentiment (нет оценённых): %v", err)
+	}
+	if avg != nil {
+		t.Errorf("хотели nil, получили %v", *avg)
+	}
+
+	// Оцениваем две: (0.6 + (-0.2)) / 2 = 0.2.
+	if err := repo.SetSentiment(ctx, 1, 0.6, ""); err != nil {
+		t.Fatalf("SetSentiment 1: %v", err)
+	}
+	if err := repo.SetSentiment(ctx, 2, -0.2, ""); err != nil {
+		t.Fatalf("SetSentiment 2: %v", err)
+	}
+
+	avg, err = repo.AvgSentimentByAsset(ctx, 1, time.Time{})
+	if err != nil {
+		t.Fatalf("AvgSentiment: %v", err)
+	}
+	if avg == nil {
+		t.Fatal("ожидали ненулевой avg")
+	}
+	if math.Abs(*avg-0.2) > 1e-9 {
+		t.Errorf("хотели avg=0.2, получили %v", *avg)
+	}
+}
+
+// TestNewsItems_NullAssetID — новость без связи с монетой (asset_id=nil) корректно
+// сохраняется и читается.
+func TestNewsItems_NullAssetID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newTestDB(t)
+	repo := NewNewsItems(d)
+
+	n := makeNewsItem("general", 0) // assetID=0 → nil
+	if _, err := repo.InsertMany(ctx, []model.NewsItem{n}); err != nil {
+		t.Fatalf("вставка: %v", err)
+	}
+
+	got, err := repo.Unscored(ctx, 10)
+	if err != nil {
+		t.Fatalf("Unscored: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("хотели 1 новость, получили %d", len(got))
+	}
+	if got[0].AssetID != nil {
+		t.Errorf("хотели nil AssetID, получили %v", *got[0].AssetID)
 	}
 }

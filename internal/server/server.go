@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -38,6 +39,7 @@ type Server struct {
 	indicatorStore *storage.IndicatorSnapshots
 	forecastStore  *storage.Forecasts
 	assetsStore    *storage.Assets
+	newsStore      *storage.NewsItems
 }
 
 // New создаёт сервер с заданными зависимостями.
@@ -47,6 +49,7 @@ func New(
 	indicatorStore *storage.IndicatorSnapshots,
 	forecastStore *storage.Forecasts,
 	assetsStore *storage.Assets,
+	newsStore *storage.NewsItems,
 ) *Server {
 	return &Server{
 		cfg:            cfg,
@@ -54,6 +57,7 @@ func New(
 		indicatorStore: indicatorStore,
 		forecastStore:  forecastStore,
 		assetsStore:    assetsStore,
+		newsStore:      newsStore,
 	}
 }
 
@@ -180,13 +184,13 @@ func (s *Server) handleForecastDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view := s.forecastView(forecast, factors, price)
+	view := s.forecastView(r.Context(), forecast, factors, price)
 	writeJSON(w, http.StatusOK, view)
 }
 
 // forecastView собирает DTO прогноза: доменный прогноз + факторы + «использованные
-// данные» (цена и значения индикаторов из снапшота).
-func (s *Server) forecastView(f model.Forecast, factors []model.ForecastFactor, price model.AssetPrice) model.ForecastView {
+// данные» (цена и значения индикаторов из снапшота) + последние новости с сентиментом.
+func (s *Server) forecastView(ctx context.Context, f model.Forecast, factors []model.ForecastFactor, price model.AssetPrice) model.ForecastView {
 	factorViews := make([]model.ForecastFactorView, 0, len(factors))
 	for _, fc := range factors {
 		factorViews = append(factorViews, model.ForecastFactorView{
@@ -206,7 +210,7 @@ func (s *Server) forecastView(f model.Forecast, factors []model.ForecastFactor, 
 		Change24H:    price.Change24H,
 		CalculatedAt: nil,
 	}
-	snap, err := s.indicatorStore.ByAsset(context.Background(), price.AssetID)
+	snap, err := s.indicatorStore.ByAsset(ctx, price.AssetID)
 	if err == nil {
 		data.RSI = snap.RSI
 		data.ROC = snap.ROC
@@ -216,6 +220,9 @@ func (s *Server) forecastView(f model.Forecast, factors []model.ForecastFactor, 
 		calculatedAt := snap.CalculatedAt
 		data.CalculatedAt = &calculatedAt
 	}
+
+	// T4: последние новости по монете за 24ч с сентимент-скором и summary.
+	news := s.newsViews(ctx, price.AssetID)
 
 	return model.ForecastView{
 		AssetID:      f.AssetID,
@@ -230,7 +237,31 @@ func (s *Server) forecastView(f model.Forecast, factors []model.ForecastFactor, 
 		RawScore:     f.RawScore,
 		Factors:      factorViews,
 		Data:         data,
+		News:         news,
 	}
+}
+
+// newsViews возвращает последние новости по монете за 24ч в виде DTO. Если
+// новостей нет — пустой слайс (не null).
+func (s *Server) newsViews(ctx context.Context, assetID int64) []model.NewsItemView {
+	since := time.Now().UTC().Add(-24 * time.Hour)
+	items, err := s.newsStore.RecentByAsset(ctx, assetID, since, 10)
+	if err != nil {
+		// Не валить ответ из-за новостей — прогноз отдаётся без них.
+		log.Printf("server: новости для asset %d: %v", assetID, err)
+		return []model.NewsItemView{}
+	}
+	views := make([]model.NewsItemView, 0, len(items))
+	for _, n := range items {
+		views = append(views, model.NewsItemView{
+			Title:            n.Title,
+			Link:             n.Link,
+			PublishedAt:      n.PublishedAt,
+			SentimentScore:   n.SentimentScore,
+			SentimentSummary: n.SentimentSummary,
+		})
+	}
+	return views
 }
 
 // indicatorsView собирает представление индикаторов по активу: читает снапшот

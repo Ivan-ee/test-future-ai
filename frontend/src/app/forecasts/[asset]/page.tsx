@@ -13,7 +13,7 @@ import {
   formatPrice,
   formatTime,
 } from "@/lib/format";
-import type { ForecastFactorView } from "@/lib/types";
+import type { ForecastFactorView, NewsItemView } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -22,6 +22,7 @@ const FACTOR_LABELS: Record<string, string> = {
   rsi: "RSI (перекупленность/перепроданность)",
   momentum: "Моментум (ROC + SMA-кроссовер)",
   volume: "Объём (интерес рынка)",
+  sentiment: "Сентимент новостей",
 };
 
 export default async function ForecastPage({
@@ -172,6 +173,18 @@ export default async function ForecastPage({
         </p>
       </section>
 
+      {/* Новости (T4) */}
+      {forecast.news.length > 0 && (
+        <section className="mb-8">
+          <h2 className="mb-4 text-xl font-semibold text-white">Новости за 24ч</h2>
+          <ul className="space-y-3">
+            {forecast.news.map((n, i) => (
+              <NewsCard key={i} news={n} />
+            ))}
+          </ul>
+        </section>
+      )}
+
       {/* Метаданные */}
       <section className="text-xs text-gray-500">
         Прогноз посчитан: {formatTime(forecast.created_at)} · пересчёт раз в час
@@ -218,6 +231,47 @@ function FactorBar({ factor }: { factor: ForecastFactorView }) {
       </div>
 
       <p className="mt-2 text-sm text-gray-400">{factor.detail}</p>
+    </li>
+  );
+}
+
+// NewsCard — карточка новости с бейджем сентимента (зелёный/красный/серый).
+function NewsCard({ news }: { news: NewsItemView }) {
+  // Сентимент-бейдж: зелёный (score > 0.1), красный (score < -0.1), серый (нейтрально/null).
+  let badgeClass = "bg-gray-800 text-gray-400";
+  let badgeText = "не оценён";
+  if (news.sentiment_score !== null) {
+    if (news.sentiment_score > 0.1) {
+      badgeClass = "bg-green-900/50 text-green-400";
+      badgeText = `+${news.sentiment_score.toFixed(2)}`;
+    } else if (news.sentiment_score < -0.1) {
+      badgeClass = "bg-red-900/50 text-red-400";
+      badgeText = news.sentiment_score.toFixed(2);
+    } else {
+      badgeClass = "bg-gray-800 text-gray-400";
+      badgeText = `${news.sentiment_score.toFixed(2)} нейтрально`;
+    }
+  }
+
+  return (
+    <li className="rounded-xl border border-gray-800 bg-gray-900/60 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <a
+          href={news.link}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-sm font-medium text-gray-200 hover:text-white"
+        >
+          {news.title}
+        </a>
+        <span className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-semibold ${badgeClass}`}>
+          {badgeText}
+        </span>
+      </div>
+      {news.sentiment_summary && (
+        <p className="mt-2 text-sm text-gray-400">{news.sentiment_summary}</p>
+      )}
+      <p className="mt-1 text-xs text-gray-600">{formatTime(news.published_at)}</p>
     </li>
   );
 }

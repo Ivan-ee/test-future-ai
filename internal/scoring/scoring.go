@@ -1,16 +1,18 @@
 // Package scoring — детерминированное ядро прогноза «вверх/вниз за 24ч».
 //
-// Чистая функция Forecast по факторам (rsi, momentum, volume) считает прогноз:
-// направление, уверенность, риск-ноту и текстовый аргумент. Никаких побочных
-// эффектов и зависимостей от БД/сети — поведение полностью покрыто тестами.
+// Чистая функция Forecast по факторам (rsi, momentum, volume, sentiment) считает
+// прогноз: направление, уверенность, риск-ноту и текстовый аргумент. Никаких
+// побочных эффектов и зависимостей от БД/сети — поведение полностью покрыто тестами.
 //
-// Формула (см. спеку T3):
+// Формула (см. спеку T3/T4):
 //
 //	raw_score       = Σ(signal_i × adjusted_weight_i)
 //	direction       = raw_score ≥ 0 ? up : down
 //	confidence      = 0.5 + |raw_score|/2 − contradiction_penalty
 //
-// Базовые веса статические (адаптация — T5); sentiment-фактор придёт в T4.
+// Базовые веса статические (адаптация — T5). Если sentiment-фактор не передан
+// (нет новостей или нет OPENAI_API_KEY), прогноз считается по 3 факторам —
+// веса перенормируются под их сумму (graceful degradation).
 package scoring
 
 import (
@@ -34,18 +36,21 @@ const Horizon = 24
 type FactorName string
 
 const (
-	FactorRSI      FactorName = "rsi"
-	FactorMomentum FactorName = "momentum"
-	FactorVolume   FactorName = "volume"
+	FactorRSI       FactorName = "rsi"
+	FactorMomentum  FactorName = "momentum"
+	FactorVolume    FactorName = "volume"
+	FactorSentiment FactorName = "sentiment"
 )
 
-// DefaultBaseWeights — базовые веса факторов из спеки T3.
-// Сумма < 1: 0.25 + 0.35 + 0.15 = 0.75 (sentiment 0.25 добавится в T4).
-// При нормировке под 3 фактора веса масштабируются так, что их сумма равна 1.0.
+// DefaultBaseWeights — базовые веса факторов из спеки T3/T4.
+// Сумма = 1.0: 0.25 + 0.35 + 0.15 + 0.25. При нормировке по присутствующим
+// факторам веса масштабируются так, что их сумма равна 1.0. Если sentiment
+// не передан — нормировка идёт по 3 факторам (сумма 0.75 → в 1.0).
 var DefaultBaseWeights = map[FactorName]float64{
-	FactorRSI:      0.25,
-	FactorMomentum: 0.35,
-	FactorVolume:   0.15,
+	FactorRSI:       0.25,
+	FactorMomentum:  0.35,
+	FactorVolume:    0.15,
+	FactorSentiment: 0.25,
 }
 
 // Factor — входной фактор: имя, сигнал [-1..1] и человекочитаемый detail

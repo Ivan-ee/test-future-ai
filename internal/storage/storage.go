@@ -259,6 +259,115 @@ FROM indicator_snapshots WHERE asset_id = ?`
 	return row.toModel(), nil
 }
 
+// NewsItems — репозиторий новостей из внешних источников.
+type NewsItems struct{ db *sqlx.DB }
+
+func NewNewsItems(db *sqlx.DB) *NewsItems { return &NewsItems{db: db} }
+
+// InsertMany добавляет новости батчем с дедупом по UNIQUE(source_id, external_id).
+// Возвращает количество фактически добавленных строк.
+func (r *NewsItems) InsertMany(ctx context.Context, items []model.NewsItem) (int, error) {
+	added := 0
+	for _, n := range items {
+		var assetID any
+		if n.AssetID != nil {
+			assetID = *n.AssetID
+		}
+		res, err := r.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO news_items
+    (asset_id, source_id, external_id, title, body, link, published_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			assetID, n.SourceID, n.ExternalID, n.Title, n.Body, n.Link, n.PublishedAt.UTC())
+		if err != nil {
+			return added, fmt.Errorf("вставка news_item %s: %w", n.ExternalID, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			added++
+		}
+	}
+	return added, nil
+}
+
+// Unscored возвращает новости без сентимента (sentiment_score IS NULL), лимит —
+// для батчевой обработки сентимент-сервисом.
+func (r *NewsItems) Unscored(ctx context.Context, limit int) ([]model.NewsItem, error) {
+	var rows []newsItemRow
+	const q = `
+SELECT id, asset_id, source_id, external_id, title, body, link, published_at,
+       sentiment_score, sentiment_summary, inserted_at
+FROM news_items WHERE sentiment_score IS NULL
+ORDER BY inserted_at ASC LIMIT ?`
+	if err := r.db.SelectContext(ctx, &rows, q, limit); err != nil {
+		return nil, fmt.Errorf("выборка неотсентиченных новостей: %w", err)
+	}
+	out := make([]model.NewsItem, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// SetSentiment проставляет сентимент одной новости. Score зажимается в [-1..1].
+func (r *NewsItems) SetSentiment(ctx context.Context, id int64, score float64, summary string) error {
+	score = clampScore(score)
+	var sumVal any
+	if summary != "" {
+		sumVal = summary
+	}
+	const q = `UPDATE news_items SET sentiment_score = ?, sentiment_summary = ? WHERE id = ?`
+	if _, err := r.db.ExecContext(ctx, q, score, sumVal, id); err != nil {
+		return fmt.Errorf("обновление сентимента news_item %d: %w", id, err)
+	}
+	return nil
+}
+
+// RecentByAsset возвращает последние новости по монете за период (с фильтром
+// по published_at >= since), отсортированные от свежих к старым. Лимит — топ-N.
+func (r *NewsItems) RecentByAsset(ctx context.Context, assetID int64, since time.Time, limit int) ([]model.NewsItem, error) {
+	var rows []newsItemRow
+	const q = `
+SELECT id, asset_id, source_id, external_id, title, body, link, published_at,
+       sentiment_score, sentiment_summary, inserted_at
+FROM news_items WHERE asset_id = ? AND published_at >= ?
+ORDER BY published_at DESC LIMIT ?`
+	if err := r.db.SelectContext(ctx, &rows, q, assetID, since.UTC(), limit); err != nil {
+		return nil, fmt.Errorf("выборка новостей по asset %d: %w", assetID, err)
+	}
+	out := make([]model.NewsItem, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// AvgSentimentByAsset возвращает средний сентимент новостей по монете за период.
+// Возвращает nil, если нет новостей с проставленным сентиментом.
+func (r *NewsItems) AvgSentimentByAsset(ctx context.Context, assetID int64, since time.Time) (*float64, error) {
+	const q = `
+SELECT AVG(sentiment_score) FROM news_items
+WHERE asset_id = ? AND published_at >= ? AND sentiment_score IS NOT NULL`
+	var avg sql.NullFloat64
+	if err := r.db.GetContext(ctx, &avg, q, assetID, since.UTC()); err != nil {
+		return nil, fmt.Errorf("средний сентимент по asset %d: %w", assetID, err)
+	}
+	if !avg.Valid {
+		return nil, nil
+	}
+	v := avg.Float64
+	return &v, nil
+}
+
+// clampScore зажимает сентимент-скор в [-1..1].
+func clampScore(v float64) float64 {
+	if v > 1 {
+		return 1
+	}
+	if v < -1 {
+		return -1
+	}
+	return v
+}
+
 // --- отображения строк БД в доменные типы ---
 
 type assetRow struct {
@@ -347,6 +456,51 @@ func (r indicatorSnapshotRow) toModel() model.IndicatorSnapshot {
 		SMA20:        r.SMA20,
 		VolumeSignal: r.VolumeSignal,
 		CalculatedAt: r.CalculatedAt,
+	}
+}
+
+type newsItemRow struct {
+	ID               int64          `db:"id"`
+	AssetID          sql.NullInt64  `db:"asset_id"`
+	SourceID         int64          `db:"source_id"`
+	ExternalID       string         `db:"external_id"`
+	Title            string         `db:"title"`
+	Body             string         `db:"body"`
+	Link             string         `db:"link"`
+	PublishedAt      time.Time      `db:"published_at"`
+	SentimentScore   sql.NullFloat64 `db:"sentiment_score"`
+	SentimentSummary sql.NullString  `db:"sentiment_summary"`
+	InsertedAt       time.Time      `db:"inserted_at"`
+}
+
+func (r newsItemRow) toModel() model.NewsItem {
+	var assetID *int64
+	if r.AssetID.Valid {
+		v := r.AssetID.Int64
+		assetID = &v
+	}
+	var score *float64
+	if r.SentimentScore.Valid {
+		v := r.SentimentScore.Float64
+		score = &v
+	}
+	var summary *string
+	if r.SentimentSummary.Valid {
+		v := r.SentimentSummary.String
+		summary = &v
+	}
+	return model.NewsItem{
+		ID:               r.ID,
+		AssetID:          assetID,
+		SourceID:         r.SourceID,
+		ExternalID:       r.ExternalID,
+		Title:            r.Title,
+		Body:             r.Body,
+		Link:             r.Link,
+		PublishedAt:      r.PublishedAt,
+		SentimentScore:   score,
+		SentimentSummary: summary,
+		InsertedAt:       r.InsertedAt,
 	}
 }
 

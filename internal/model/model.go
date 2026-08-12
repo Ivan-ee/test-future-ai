@@ -170,8 +170,34 @@ type ForecastDataView struct {
 	CalculatedAt *time.Time `json:"calculated_at"` // время расчёта индикаторов
 }
 
+// NewsItem — новость из внешнего источника (CoinPaprika, RSS). Может быть
+// связана с конкретной монетой (AssetID != nil) или быть общей (AssetID == nil,
+// например лента CoinDesk). Сентимент проставляется позже через OpenAI.
+type NewsItem struct {
+	ID               int64
+	AssetID          *int64  // nullable: связь с монетой, если возможно
+	SourceID         int64
+	ExternalID       string  // идентификатор новости у источника (для дедупа)
+	Title            string
+	Body             string
+	Link             string
+	PublishedAt      time.Time
+	SentimentScore   *float64 // nullable: проставляется сентимент-сервисом
+	SentimentSummary *string  // nullable: короткое резюме сентимента
+	InsertedAt       time.Time
+}
+
+// NewsItemView — DTO новости для API: только то, что нужно карточке прогноза.
+type NewsItemView struct {
+	Title            string   `json:"title"`
+	Link             string   `json:"link"`
+	PublishedAt      time.Time `json:"published_at"`
+	SentimentScore   *float64 `json:"sentiment_score"`   // null, если не оценён
+	SentimentSummary *string  `json:"sentiment_summary"` // null, если не оценён
+}
+
 // ForecastView — DTO для эндпоинта GET /api/forecasts/:asset: полный прогноз
-// с декомпозицией по факторам и использованными данными.
+// с декомпозицией по факторам, использованными данными и последними новостями.
 type ForecastView struct {
 	AssetID      int64                `json:"asset_id"`
 	Symbol       string               `json:"symbol"`
@@ -185,6 +211,7 @@ type ForecastView struct {
 	RawScore     float64              `json:"raw_score"`
 	Factors      []ForecastFactorView `json:"factors"`
 	Data         ForecastDataView     `json:"data"`
+	News         []NewsItemView       `json:"news"`
 }
 
 // ForecastSummary — краткий прогноз для списка и главной страницы:

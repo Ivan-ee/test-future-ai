@@ -40,9 +40,13 @@ var DefaultAssets = []SeedAsset{
 	{CoinID: "ripple", Symbol: "XRP", Name: "XRP"},
 }
 
-// DefaultSources — на старте один источник, CoinGecko (второй придёт в T4).
+// DefaultSources — источники данных. T1: CoinGecko (цены). T4: источники
+// новостей — CoinPaprika и RSS-ленты CoinDesk/Cointelegraph.
 var DefaultSources = []SeedSource{
 	{Slug: "coingecko", Name: "CoinGecko"},
+	{Slug: "coinpaprika", Name: "CoinPaprika"},
+	{Slug: "rss-coindesk", Name: "CoinDesk (RSS)"},
+	{Slug: "rss-cointelegraph", Name: "Cointelegraph (RSS)"},
 }
 
 // Open открывает SQLite по пути path, включает foreign_keys и WAL,

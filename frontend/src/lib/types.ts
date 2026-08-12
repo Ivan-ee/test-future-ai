@@ -48,7 +48,7 @@ export interface ForecastSummary {
 
 /** Декомпозиция вклада фактора в прогноз. */
 export interface ForecastFactorView {
-  name: string; // "rsi" | "momentum" | "volume"
+  name: string; // "rsi" | "momentum" | "volume" | "sentiment"
   signal: number; // [-1, 1]
   base_weight: number;
   adjusted_weight: number;
@@ -68,6 +68,15 @@ export interface ForecastDataView {
   calculated_at: string | null;
 }
 
+/** Новость с сентиментом — элемент блока «Новости» в карточке прогноза. */
+export interface NewsItemView {
+  title: string;
+  link: string;
+  published_at: string; // ISO-дата
+  sentiment_score: number | null; // [-1, 1] или null, если не оценён
+  sentiment_summary: string | null; // короткое резюме или null
+}
+
 /** Детальная карточка прогноза — ответ GET /api/forecasts/:asset. */
 export interface ForecastView {
   asset_id: number;
@@ -82,4 +91,5 @@ export interface ForecastView {
   raw_score: number;
   factors: ForecastFactorView[];
   data: ForecastDataView;
+  news: NewsItemView[];
 }

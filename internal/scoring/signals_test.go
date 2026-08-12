@@ -141,3 +141,57 @@ func TestForecast_FromIndicators_BullishAgreement(t *testing.T) {
 		t.Errorf("согласный набор: confidence слишком низкий %v", r.Confidence)
 	}
 }
+
+// --- T4: SentimentSignal ---
+
+func TestSentimentSignal_PositiveIsPositive(t *testing.T) {
+	t.Parallel()
+	sig, detail := SentimentSignal(0.6)
+	if sig <= 0 {
+		t.Errorf("позитивный сентимент 0.6: хотели >0, получили %v", sig)
+	}
+	if detail == "" {
+		t.Error("detail не должен быть пустым")
+	}
+}
+
+func TestSentimentSignal_NegativeIsNegative(t *testing.T) {
+	t.Parallel()
+	sig, _ := SentimentSignal(-0.6)
+	if sig >= 0 {
+		t.Errorf("негативный сентимент -0.6: хотели <0, получили %v", sig)
+	}
+}
+
+func TestSentimentSignal_ClampedToRange(t *testing.T) {
+	t.Parallel()
+	for _, s := range []float64{-2, -1.5, 0, 0.8, 1.5, 3} {
+		sig, _ := SentimentSignal(s)
+		if sig < -1 || sig > 1 {
+			t.Errorf("sentiment=%v: сигнал %v вне [-1,1]", s, sig)
+		}
+	}
+}
+
+// --- T4: FactorsFromIndicatorsAndSentiment ---
+
+func TestFactorsFromIndicatorsAndSentiment_WithSentiment(t *testing.T) {
+	t.Parallel()
+	in := IndicatorInput{RSI: 50, ROC: 1, SMA7: 100, SMA20: 100, VolumeSignal: 1.0}
+	factors := FactorsFromIndicatorsAndSentiment(in, 0.5, true, 0.2)
+	if len(factors) != 4 {
+		t.Fatalf("хотели 4 фактора (с sentiment), получили %d", len(factors))
+	}
+	if factors[3].Name != FactorSentiment {
+		t.Errorf("4-й фактор: хотели sentiment, получили %s", factors[3].Name)
+	}
+}
+
+func TestFactorsFromIndicatorsAndSentiment_WithoutSentiment(t *testing.T) {
+	t.Parallel()
+	in := IndicatorInput{RSI: 50, ROC: 1, SMA7: 100, SMA20: 100, VolumeSignal: 1.0}
+	factors := FactorsFromIndicatorsAndSentiment(in, 0, false, 0.2)
+	if len(factors) != 3 {
+		t.Fatalf("хотели 3 фактора (без sentiment), получили %d", len(factors))
+	}
+}

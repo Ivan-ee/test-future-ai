@@ -3,13 +3,18 @@ package worker
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 
 	"test-future/internal/config"
 	"test-future/internal/db"
 	"test-future/internal/model"
+	"test-future/internal/scoring"
+	"test-future/internal/sentiment"
 	"test-future/internal/source/coingecko"
+	"test-future/internal/source/coinpaprika"
+	"test-future/internal/source/rss"
 	"test-future/internal/storage"
 )
 
@@ -35,6 +40,29 @@ func (f fakeTaker) MarketChart(_ context.Context, coinID string, _ int) (coingec
 	return coingecko.MarketChart{}, nil
 }
 
+// fakeNewsTaker — тестовый источник новостей CoinPaprika.
+type fakeNewsTaker struct {
+	news []coinpaprika.RawNews
+	err  error
+}
+
+func (f fakeNewsTaker) News(_ context.Context, _ []string, _ int) ([]coinpaprika.RawNews, error) {
+	return f.news, f.err
+}
+
+// fakeRSSTaker — тестовый источник RSS-новостей.
+type fakeRSSTaker struct {
+	news map[string][]rss.RawNews // slug → новости
+	err  error
+}
+
+func (f fakeRSSTaker) News(_ context.Context, slug string) ([]rss.RawNews, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.news[slug], nil
+}
+
 // newWorkerDB открывает тестовую БД с сидингом.
 func newWorkerDB(t *testing.T) *sqlx.DB {
 	t.Helper()
@@ -46,20 +74,54 @@ func newWorkerDB(t *testing.T) *sqlx.DB {
 	return d
 }
 
+// workerDeps — набор репозиториев + сентимент-сервис для тестового worker.
+// Собирается один раз и переиспользуется, чтобы не дублировать 11 параметров.
+type workerDeps struct {
+	assets    *storage.Assets
+	sources   *storage.Sources
+	prices    *storage.PricePoints
+	logs      *storage.UpdateLog
+	indicators *storage.IndicatorSnapshots
+	forecasts *storage.Forecasts
+	news      *storage.NewsItems
+	sentiment *sentiment.Service
+}
+
+func newWorkerDeps(d *sqlx.DB) workerDeps {
+	news := storage.NewNewsItems(d)
+	return workerDeps{
+		assets:     storage.NewAssets(d),
+		sources:    storage.NewSources(d),
+		prices:     storage.NewPricePoints(d),
+		logs:       storage.NewUpdateLog(d),
+		indicators: storage.NewIndicatorSnapshots(d),
+		forecasts:  storage.NewForecasts(d),
+		news:       news,
+		sentiment:  sentiment.New("", news), // noop по умолчанию
+	}
+}
+
+// newTestWorker собирает worker с заданными фейковыми источниками.
+func newTestWorker(t *testing.T, d *sqlx.DB, taker fakeTaker, deps workerDeps) *Worker {
+	t.Helper()
+	return NewWithTakers(
+		config.Config{FetchIntervalMin: 10},
+		taker,
+		fakeNewsTaker{},
+		fakeRSSTaker{},
+		deps.assets, deps.sources, deps.prices, deps.logs,
+		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+	)
+}
+
 // TestFetchOnce_WritesPointsAndLog — один цикл worker: тянет цены, пишет точки
 // и успешную запись в update_log. Проверяем сквозной путь источник→БД.
 func TestFetchOnce_WritesPointsAndLog(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	assetsRepo := storage.NewAssets(d)
-	sourcesRepo := storage.NewSources(d)
-	priceRepo := storage.NewPricePoints(d)
-	logRepo := storage.NewUpdateLog(d)
-	indRepo := storage.NewIndicatorSnapshots(d)
-
-	cfg := config.Config{FetchIntervalMin: 10}
 	taker := fakeTaker{coins: []coingecko.MarketCoin{
 		{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
 			CurrentPrice: 60000, MarketCap: 1e12, TotalVolume: 3e10,
@@ -68,7 +130,7 @@ func TestFetchOnce_WritesPointsAndLog(t *testing.T) {
 			CurrentPrice: 3000, MarketCap: 3.6e11, TotalVolume: 1.5e10,
 			PriceChangePercentage24H: -0.5, LastUpdated: "2026-08-12T10:00:00Z"},
 	}}
-	w := NewWithTaker(cfg, taker, assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo, storage.NewForecasts(d))
+	w := newTestWorker(t, d, taker, deps)
 
 	w.fetchOnce(ctx)
 
@@ -110,17 +172,9 @@ func TestFetchOnce_SourceErrorLogged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	w := NewWithTaker(
-		config.Config{FetchIntervalMin: 10},
-		fakeTaker{err: errFake("источник недоступен")},
-		storage.NewAssets(d),
-		storage.NewSources(d),
-		storage.NewPricePoints(d),
-		storage.NewUpdateLog(d),
-		storage.NewIndicatorSnapshots(d),
-		storage.NewForecasts(d),
-	)
+	w := newTestWorker(t, d, fakeTaker{err: errFake("источник недоступен")}, deps)
 
 	w.fetchOnce(ctx)
 
@@ -152,19 +206,11 @@ func TestFetchOnce_DedupOnRetry(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	w := NewWithTaker(
-		config.Config{FetchIntervalMin: 10},
-		fakeTaker{coins: []coingecko.MarketCoin{
-			{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
-		}},
-		storage.NewAssets(d),
-		storage.NewSources(d),
-		storage.NewPricePoints(d),
-		storage.NewUpdateLog(d),
-		storage.NewIndicatorSnapshots(d),
-		storage.NewForecasts(d),
-	)
+	w := newTestWorker(t, d, fakeTaker{coins: []coingecko.MarketCoin{
+		{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
+	}}, deps)
 
 	w.fetchOnce(ctx)
 	w.fetchOnce(ctx) // те же данные — дедуп
@@ -202,12 +248,7 @@ func TestFetchOnce_IndicatorsComputed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
-
-	assetsRepo := storage.NewAssets(d)
-	sourcesRepo := storage.NewSources(d)
-	priceRepo := storage.NewPricePoints(d)
-	logRepo := storage.NewUpdateLog(d)
-	indRepo := storage.NewIndicatorSnapshots(d)
+	deps := newWorkerDeps(d)
 
 	// Монотонный ряд из 25 точек → достаточно для RSI(14)/ROC(10)/SMA(20).
 	chart := buildMonotonicChart(25, 1723334400000)
@@ -221,12 +262,11 @@ func TestFetchOnce_IndicatorsComputed(t *testing.T) {
 		},
 		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
 	}
-	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
-		assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo, storage.NewForecasts(d))
+	w := newTestWorker(t, d, taker, deps)
 
 	w.fetchOnce(ctx)
 
-	snap, err := indRepo.ByAsset(ctx, 1) // bitcoin → asset_id=1 из сидинга
+	snap, err := deps.indicators.ByAsset(ctx, 1) // bitcoin → asset_id=1 из сидинга
 	if err != nil {
 		t.Fatalf("снапшот индикаторов должен быть сохранён: %v", err)
 	}
@@ -252,8 +292,8 @@ func TestFetchOnce_IndicatorsSkippedOnShortSeries(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	indRepo := storage.NewIndicatorSnapshots(d)
 	// Ряд из 5 точек — меньше rocPeriod(10)+1=11, расчёт пропускается.
 	chart := buildMonotonicChart(5, 1723334400000)
 	taker := fakeTaker{
@@ -262,14 +302,12 @@ func TestFetchOnce_IndicatorsSkippedOnShortSeries(t *testing.T) {
 		},
 		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
 	}
-	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
-		storage.NewAssets(d), storage.NewSources(d),
-		storage.NewPricePoints(d), storage.NewUpdateLog(d), indRepo, storage.NewForecasts(d))
+	w := newTestWorker(t, d, taker, deps)
 
 	w.fetchOnce(ctx)
 
 	// Снапшота нет — цикл корректно пропустил расчёт.
-	if _, err := indRepo.ByAsset(ctx, 1); err == nil {
+	if _, err := deps.indicators.ByAsset(ctx, 1); err == nil {
 		t.Fatal("не ожидали снапшот при коротком ряде")
 	}
 
@@ -291,8 +329,8 @@ func TestComputeForecasts_FromIndicators(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	forecastRepo := storage.NewForecasts(d)
 	chart := buildMonotonicChart(25, 1723334400000)
 	taker := fakeTaker{
 		coins: []coingecko.MarketCoin{
@@ -301,17 +339,14 @@ func TestComputeForecasts_FromIndicators(t *testing.T) {
 		},
 		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
 	}
-	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
-		storage.NewAssets(d), storage.NewSources(d),
-		storage.NewPricePoints(d), storage.NewUpdateLog(d),
-		storage.NewIndicatorSnapshots(d), forecastRepo)
+	w := newTestWorker(t, d, taker, deps)
 
 	// Сначала цикл цен/индикаторов, затем — прогнозов.
 	w.fetchOnce(ctx)
 	w.computeForecasts(ctx)
 
 	// Должен появиться активный прогноз по bitcoin (asset_id=1).
-	fc, factors, err := forecastRepo.LatestByAsset(ctx, 1)
+	fc, factors, err := deps.forecasts.LatestByAsset(ctx, 1)
 	if err != nil {
 		t.Fatalf("прогноз должен быть сохранён: %v", err)
 	}
@@ -327,8 +362,9 @@ func TestComputeForecasts_FromIndicators(t *testing.T) {
 	if fc.ArgumentText == "" {
 		t.Error("argument_text не должен быть пустым")
 	}
+	// Без новостей → прогноз на 3 факторах (graceful degradation).
 	if len(factors) != 3 {
-		t.Errorf("хотели 3 фактора, получили %d", len(factors))
+		t.Errorf("хотели 3 фактора (без sentiment), получили %d", len(factors))
 	}
 
 	// Повторный расчёт — предыдущий прогноз уходит в superseded, новый active.
@@ -354,14 +390,11 @@ func TestComputeForecasts_SkipsWithoutIndicators(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
 
-	w := NewWithTaker(config.Config{FetchIntervalMin: 10},
-		fakeTaker{coins: []coingecko.MarketCoin{
-			{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
-		}},
-		storage.NewAssets(d), storage.NewSources(d),
-		storage.NewPricePoints(d), storage.NewUpdateLog(d),
-		storage.NewIndicatorSnapshots(d), storage.NewForecasts(d))
+	w := newTestWorker(t, d, fakeTaker{coins: []coingecko.MarketCoin{
+		{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
+	}}, deps)
 
 	// fetchOnce не дал исторического ряда → индикаторов нет.
 	w.fetchOnce(ctx)
@@ -375,3 +408,158 @@ func TestComputeForecasts_SkipsWithoutIndicators(t *testing.T) {
 		t.Errorf("без индикаторов не должно быть прогнозов, получили %d", n)
 	}
 }
+
+// --- T4: новости + сентимент в worker ---
+
+// TestFetchNews_CoinPaprikaWritesItems — fetchOnce с фейковыми новостями CoinPaprika
+// сохраняет их в news_items и связывает с монетой.
+func TestFetchNews_CoinPaprikaWritesItems(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
+
+	taker := fakeTaker{coins: []coingecko.MarketCoin{
+		{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
+	}}
+	news := fakeNewsTaker{news: []coinpaprika.RawNews{
+		{ID: "cp-1", Title: "BTC rally", Summary: "Bitcoin up",
+			URL: "https://cp.com/1", PublishedAt: "2026-08-12T10:00:00Z",
+			RelatedCoins: []string{"btc-bitcoin"}},
+	}}
+	w := NewWithTakers(
+		config.Config{FetchIntervalMin: 10}, taker, news, fakeRSSTaker{},
+		deps.assets, deps.sources, deps.prices, deps.logs,
+		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+	)
+
+	w.fetchOnce(ctx)
+
+	var n int
+	if err := d.GetContext(ctx, &n, `SELECT COUNT(*) FROM news_items WHERE source_id=(SELECT id FROM sources WHERE slug='coinpaprika')`); err != nil {
+		t.Fatalf("count news_items: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("хотели 1 новость CoinPaprika, получили %d", n)
+	}
+
+	// Новость связана с bitcoin (asset_id=1).
+	var assetID *int64
+	if err := d.QueryRowxContext(ctx,
+		`SELECT asset_id FROM news_items WHERE external_id='cp-1'`).Scan(&assetID); err != nil {
+		t.Fatalf("select news: %v", err)
+	}
+	if assetID == nil || *assetID != 1 {
+		t.Errorf("хотели asset_id=1, получили %v", assetID)
+	}
+}
+
+// TestFetchNews_RSSWritesItems — RSS-новости сохраняются без привязки к монете.
+func TestFetchNews_RSSWritesItems(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
+
+	taker := fakeTaker{coins: []coingecko.MarketCoin{
+		{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
+	}}
+	rssTaker := fakeRSSTaker{news: map[string][]rss.RawNews{
+		rss.SlugCoindesk: {
+			{ExternalID: "https://cd.com/1", Title: "Crypto news", Summary: "Big update",
+				Link: "https://cd.com/1"},
+		},
+	}}
+	w := NewWithTakers(
+		config.Config{FetchIntervalMin: 10}, taker, fakeNewsTaker{}, rssTaker,
+		deps.assets, deps.sources, deps.prices, deps.logs,
+		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
+	)
+
+	w.fetchOnce(ctx)
+
+	var n int
+	if err := d.GetContext(ctx, &n, `SELECT COUNT(*) FROM news_items WHERE source_id=(SELECT id FROM sources WHERE slug='rss-coindesk')`); err != nil {
+		t.Fatalf("count news_items: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("хотели 1 RSS-новость, получили %d", n)
+	}
+}
+
+// TestComputeForecasts_WithSentiment — при наличии оценённых новостей прогноз
+// включает 4-й фактор sentiment.
+func TestComputeForecasts_WithSentiment(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+	deps := newWorkerDeps(d)
+
+	chart := buildMonotonicChart(25, 1723334400000)
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
+				CurrentPrice: 25, TotalVolume: 1000, LastUpdated: "2024-09-04T00:00:00Z"},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := newTestWorker(t, d, taker, deps)
+
+	// Сначала индикаторы.
+	w.fetchOnce(ctx)
+
+	// Вставляем новость с позитивным сентиментом по bitcoin.
+	assetID := int64(1)
+	if _, err := deps.news.InsertMany(ctx, []model.NewsItem{{
+		AssetID: &assetID, SourceID: 2, ExternalID: "sent-test",
+		Title: "BTC soars", Body: "Bitcoin hits new high", Link: "https://x.com/1",
+		PublishedAt: timeNowUTC(),
+	}}); err != nil {
+		t.Fatalf("вставка новости: %v", err)
+	}
+	// Проставляем сентимент.
+	items, err := deps.news.Unscored(ctx, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("Unscored: err=%v len=%d", err, len(items))
+	}
+	if err := deps.news.SetSentiment(ctx, items[0].ID, 0.8, "очень позитивно"); err != nil {
+		t.Fatalf("SetSentiment: %v", err)
+	}
+
+	w.computeForecasts(ctx)
+
+	fc, factors, err := deps.forecasts.LatestByAsset(ctx, 1)
+	if err != nil {
+		t.Fatalf("прогноз: %v", err)
+	}
+	// Должно быть 4 фактора (sentiment добавлен).
+	hasSentiment := false
+	for _, f := range factors {
+		if f.Name == string(scoring.FactorSentiment) {
+			hasSentiment = true
+			if f.Signal < 0.7 {
+				t.Errorf("sentiment signal: хотели ≈0.8, получили %v", f.Signal)
+			}
+		}
+	}
+	if !hasSentiment {
+		t.Errorf("хотели 4 фактора (с sentiment), получили %d: %+v", len(factors), factorNames(factors))
+	}
+
+	// Позитивный сентимент + монотонный рост → прогноз «вверх» с высокой уверенностью.
+	if fc.Direction != "up" {
+		t.Errorf("хотели up, получили %s", fc.Direction)
+	}
+}
+
+// factorNames — список имён факторов для отладочного вывода.
+func factorNames(factors []model.ForecastFactor) []string {
+	names := make([]string, len(factors))
+	for i, f := range factors {
+		names[i] = f.Name
+	}
+	return names
+}
+
+// timeNowUTC — текущий момент в UTC (для published_at в тестах).
+func timeNowUTC() (t time.Time) { return time.Now().UTC() }

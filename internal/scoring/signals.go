@@ -129,6 +129,35 @@ func FactorsFromIndicators(in IndicatorInput, volumeTolerance float64) []Factor 
 	}
 }
 
+// FactorsFromIndicatorsAndSentiment собирает факторы из индикаторов и (опционально)
+// добавляет 4-й фактор — sentiment. Если hasSentiment=false, возвращаются только
+// 3 технических фактора (graceful degradation).
+func FactorsFromIndicatorsAndSentiment(in IndicatorInput, sentimentScore float64, hasSentiment bool, volumeTolerance float64) []Factor {
+	factors := FactorsFromIndicators(in, volumeTolerance)
+	if hasSentiment {
+		sig, detail := SentimentSignal(sentimentScore)
+		factors = append(factors, Factor{Name: FactorSentiment, Signal: sig, Detail: detail})
+	}
+	return factors
+}
+
+// SentimentSignal переводит средний сентимент новостей [-1..1] за период в сигнал
+// [-1..1]. Тождественен по значению (сентимент уже нормирован), но добавляет
+// человекочитаемый detail для argument_text.
+func SentimentSignal(avgScore float64) (float64, string) {
+	avgScore = clamp(avgScore)
+	note := "нейтральный сентимент новостей"
+	switch {
+	case avgScore > 0.3:
+		note = fmt.Sprintf("позитивный сентимент новостей (%.2f) → вверх", avgScore)
+	case avgScore < -0.3:
+		note = fmt.Sprintf("негативный сентимент новостей (%.2f) → вниз", avgScore)
+	default:
+		note = fmt.Sprintf("умеренный сентимент новостей (%.2f)", avgScore)
+	}
+	return avgScore, note
+}
+
 // clamp зажимает сигнал в [-1..1].
 func clamp(v float64) float64 {
 	if v > 1 {

@@ -237,3 +237,100 @@ func TestForecast_PartialSignals(t *testing.T) {
 		t.Errorf("confidence вне диапазона: %v", r.Confidence)
 	}
 }
+
+// --- T4: sentiment-фактор ---
+
+// fourBullish — четыре фактора, все смотрят вверх (сигналы +1), включая sentiment.
+func fourBullish() []Factor {
+	return []Factor{
+		{Name: FactorRSI, Signal: 1, Detail: "RSI нейтрален"},
+		{Name: FactorMomentum, Signal: 1, Detail: "моментум вверх"},
+		{Name: FactorVolume, Signal: 1, Detail: "объём выше среднего"},
+		{Name: FactorSentiment, Signal: 1, Detail: "сентимент позитивный"},
+	}
+}
+
+// fourBearish — четыре фактора, все смотрят вниз (сигналы -1), включая sentiment.
+func fourBearish() []Factor {
+	return []Factor{
+		{Name: FactorRSI, Signal: -1},
+		{Name: FactorMomentum, Signal: -1},
+		{Name: FactorVolume, Signal: -1},
+		{Name: FactorSentiment, Signal: -1},
+	}
+}
+
+// TestForecast_FourFactors_WeightsSumToOne — при 4 факторах веса суммируются в 1.0.
+func TestForecast_FourFactors_WeightsSumToOne(t *testing.T) {
+	t.Parallel()
+	r := Forecast(fourBullish(), nil)
+	sum := 0.0
+	for _, f := range r.Factors {
+		sum += f.AdjustedWeight
+	}
+	approx(t, "Σ adjusted_weight (4 фактора)", sum, 1.0)
+}
+
+// TestForecast_FourFactors_AdjustedWeightsProportional — веса 4 факторов
+// пропорциональны базовым (0.25+0.35+0.15+0.25=1.0, т.е. нормировка не меняет их).
+func TestForecast_FourFactors_AdjustedWeightsProportional(t *testing.T) {
+	t.Parallel()
+	r := Forecast(fourBullish(), nil)
+	// Базовая сумма 1.0 → нормированные равны базовым.
+	want := map[FactorName]float64{
+		FactorRSI:       0.25,
+		FactorMomentum:  0.35,
+		FactorVolume:    0.15,
+		FactorSentiment: 0.25,
+	}
+	for _, f := range r.Factors {
+		approx(t, "adjusted_weight "+string(f.Name), f.AdjustedWeight, want[f.Name])
+	}
+}
+
+// TestForecast_FourFactors_FullAgreementConfidenceOne — все 4 фактора +1 →
+// raw_score=1.0, confidence=1.0.
+func TestForecast_FourFactors_FullAgreementConfidenceOne(t *testing.T) {
+	t.Parallel()
+	r := Forecast(fourBullish(), nil)
+	approx(t, "confidence (4 фактора, согласие)", r.Confidence, 1.0)
+}
+
+// TestForecast_GracefulDegradation_ThreeFactors — без sentiment прогноз считается
+// по 3 факторам; веса перенормируются под их сумму (0.75 → 1.0).
+func TestForecast_GracefulDegradation_ThreeFactors(t *testing.T) {
+	t.Parallel()
+	r := Forecast(threeBullish(), nil)
+	if len(r.Factors) != 3 {
+		t.Fatalf("хотели 3 фактора (без sentiment), получили %d", len(r.Factors))
+	}
+	sum := 0.0
+	for _, f := range r.Factors {
+		sum += f.AdjustedWeight
+	}
+	approx(t, "Σ adjusted_weight (3 фактора)", sum, 1.0)
+	// direction и confidence в норме.
+	if r.Direction != DirectionUp {
+		t.Errorf("3 bullish фактора: хотели up, получили %s", r.Direction)
+	}
+}
+
+// TestForecast_SentimentFlipsDirection — sentiment может перевесить направление:
+// 3 технических фактора умеренно вверх, но сильный негативный сентимент — итог вниз.
+func TestForecast_SentimentFlipsDirection(t *testing.T) {
+	t.Parallel()
+	factors := []Factor{
+		{Name: FactorRSI, Signal: 0.2},
+		{Name: FactorMomentum, Signal: 0.2},
+		{Name: FactorVolume, Signal: 0.2},
+		{Name: FactorSentiment, Signal: -1}, // сильный негатив
+	}
+	r := Forecast(factors, nil)
+	// Сентимент (вес 0.25, сигнал -1) перевешивает три слабых позитивных фактора.
+	// Вклад sentiment: -1 × 0.25 = -0.25. Вклад остальных: (0.2×0.25 + 0.2×0.35 + 0.2×0.15) = 0.15.
+	// raw_score = 0.15 - 0.25 = -0.1 → down.
+	if r.Direction != DirectionDown {
+		t.Errorf("сильный негативный сентимент: хотели down, получили %s (raw=%v)",
+			r.Direction, r.RawScore)
+	}
+}

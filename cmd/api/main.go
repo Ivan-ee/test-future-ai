@@ -17,6 +17,7 @@ import (
 
 	"test-future/internal/config"
 	"test-future/internal/db"
+	"test-future/internal/sentiment"
 	"test-future/internal/server"
 	"test-future/internal/storage"
 	"test-future/internal/worker"
@@ -56,13 +57,21 @@ func run() error {
 	logRepo := storage.NewUpdateLog(database)
 	indicatorRepo := storage.NewIndicatorSnapshots(database)
 	forecastRepo := storage.NewForecasts(database)
+	newsRepo := storage.NewNewsItems(database)
+
+	// Сентимент-сервис (noop без OPENAI_API_KEY — прогноз на 3 факторах).
+	sentimentSvc := sentiment.New(cfg.OpenAIAPIKey, newsRepo)
+	if !sentimentSvc.Enabled() {
+		log.Printf("OPENAI_API_KEY не задан — сентимент выключен, прогноз без 4-го фактора")
+	}
 
 	// Worker: опрос источников в горутине.
-	wkr := worker.New(cfg, assetsRepo, sourcesRepo, priceRepo, logRepo, indicatorRepo, forecastRepo)
+	wkr := worker.New(cfg, assetsRepo, sourcesRepo, priceRepo, logRepo,
+		indicatorRepo, forecastRepo, newsRepo, sentimentSvc)
 	go wkr.Run(rootCtx)
 
 	// HTTP-сервер.
-	srv := server.New(cfg, priceRepo, indicatorRepo, forecastRepo, assetsRepo)
+	srv := server.New(cfg, priceRepo, indicatorRepo, forecastRepo, assetsRepo, newsRepo)
 	httpServer := &http.Server{
 		Addr:              cfg.BackendAddr(),
 		Handler:           srv.Router(),
