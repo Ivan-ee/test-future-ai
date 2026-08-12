@@ -22,8 +22,9 @@ export default async function HomePage() {
       <header className="mb-10">
         <h1 className="text-3xl font-bold text-white">test-future</h1>
         <p className="mt-2 text-gray-400">
-          Live-цены криптовалют из CoinGecko. Прогнозы появятся позже — пока
-          фундамент: реальные цены доходят до экрана.
+          Live-цены криптовалют из CoinGecko и технические индикаторы (RSI/ROC/
+          SMA/объём). Кликните по монете, чтобы увидеть посчитанные индикаторы и
+          их интерпретацию. Прогнозы появятся позже.
         </p>
       </header>
 

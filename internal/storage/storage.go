@@ -124,6 +124,79 @@ ORDER BY a.id`
 	return out, nil
 }
 
+// LatestByAssetID возвращает DTO последней цены для одного актива по его id.
+// Используется детальным эндпоинтом GET /api/assets/{id}. Если актив не найден
+// среди зарегистрированных (даже без точек цен) — sql.ErrNoRows; вызывающий
+// трактует это как 404. Актив без цен вернётся с нулевой ценой и ошибкой nil.
+func (r *PricePoints) LatestByAssetID(ctx context.Context, assetID int64) (model.AssetPrice, error) {
+	items, err := r.LatestByAsset(ctx)
+	if err != nil {
+		return model.AssetPrice{}, err
+	}
+	for _, ap := range items {
+		if ap.AssetID == assetID {
+			return ap, nil
+		}
+	}
+	return model.AssetPrice{}, sql.ErrNoRows
+}
+
+// LastClosesByAsset возвращает последние n цен закрытия актива по возрастанию ts
+// (старые → новые) — для расчёта индикаторов (RSI/ROC/SMA).
+func (r *PricePoints) LastClosesByAsset(ctx context.Context, assetID int64, n int) ([]float64, error) {
+	rows, err := r.lastDedupedByAsset(ctx, assetID, n)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float64, len(rows))
+	for i, row := range rows {
+		out[i] = row.PriceUSD
+	}
+	return out, nil
+}
+
+// LastVolumesByAsset возвращает последние n объёмов актива по возрастанию ts —
+// для расчёта VolumeSignal.
+func (r *PricePoints) LastVolumesByAsset(ctx context.Context, assetID int64, n int) ([]float64, error) {
+	rows, err := r.lastDedupedByAsset(ctx, assetID, n)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float64, len(rows))
+	for i, row := range rows {
+		out[i] = row.Volume
+	}
+	return out, nil
+}
+
+// dedupedRow — одна точка ряда (дедуплицированная по ts) для расчёта индикаторов.
+type dedupedRow struct {
+	PriceUSD float64 `db:"price_usd"`
+	Volume   float64 `db:"volume"`
+}
+
+// lastDedupedByAsset — общий хелпер: последние n точек (цена + объём) актива
+// по возрастанию ts с дедупом по моменту (детерминированно минимальный source_id).
+// Используется и для closes, и для volumes, чтобы логика дедупа была в одном месте.
+func (r *PricePoints) lastDedupedByAsset(ctx context.Context, assetID int64, n int) ([]dedupedRow, error) {
+	const q = `
+SELECT pp.price_usd AS price_usd, pp.volume AS volume FROM (
+    SELECT ts, MIN(source_id) AS sid
+    FROM price_points
+    WHERE asset_id = ?
+    GROUP BY ts
+    ORDER BY ts DESC
+    LIMIT ?
+) d
+JOIN price_points pp ON pp.asset_id = ? AND pp.ts = d.ts AND pp.source_id = d.sid
+ORDER BY d.ts ASC`
+	var rows []dedupedRow
+	if err := r.db.SelectContext(ctx, &rows, q, assetID, n, assetID); err != nil {
+		return nil, fmt.Errorf("выборка ряда для asset %d: %w", assetID, err)
+	}
+	return rows, nil
+}
+
 // UpdateLog — репозиторий журнала обновлений.
 type UpdateLog struct{ db *sqlx.DB }
 
@@ -141,6 +214,49 @@ VALUES (?, ?, ?, ?, ?, ?)`
 		return fmt.Errorf("вставка update_log: %w", err)
 	}
 	return nil
+}
+
+// IndicatorSnapshots — репозиторий посчитанных индикаторов.
+type IndicatorSnapshots struct{ db *sqlx.DB }
+
+func NewIndicatorSnapshots(db *sqlx.DB) *IndicatorSnapshots {
+	return &IndicatorSnapshots{db: db}
+}
+
+// Upsert сохраняет последние значения индикаторов по активу. При конфликте
+// по asset_id — обновляет все поля (одна актуальная строка на монету).
+func (r *IndicatorSnapshots) Upsert(ctx context.Context, s model.IndicatorSnapshot) error {
+	const q = `
+INSERT INTO indicator_snapshots
+    (asset_id, source_id, rsi, roc, sma_7, sma_20, volume_signal, calculated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(asset_id) DO UPDATE SET
+    source_id      = excluded.source_id,
+    rsi            = excluded.rsi,
+    roc            = excluded.roc,
+    sma_7          = excluded.sma_7,
+    sma_20         = excluded.sma_20,
+    volume_signal  = excluded.volume_signal,
+    calculated_at  = excluded.calculated_at`
+	_, err := r.db.ExecContext(ctx, q,
+		s.AssetID, s.SourceID, s.RSI, s.ROC, s.SMA7, s.SMA20, s.VolumeSignal, s.CalculatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("upsert indicator_snapshot для asset %d: %w", s.AssetID, err)
+	}
+	return nil
+}
+
+// ByAsset возвращает последний снапшот индикаторов по активу. Если данных ещё
+// нет — sql.ErrNoRows (детальный эндпоинт трактует как «индикаторы не готовы»).
+func (r *IndicatorSnapshots) ByAsset(ctx context.Context, assetID int64) (model.IndicatorSnapshot, error) {
+	var row indicatorSnapshotRow
+	const q = `
+SELECT id, asset_id, source_id, rsi, roc, sma_7, sma_20, volume_signal, calculated_at
+FROM indicator_snapshots WHERE asset_id = ?`
+	if err := r.db.GetContext(ctx, &row, q, assetID); err != nil {
+		return model.IndicatorSnapshot{}, fmt.Errorf("выборка indicator_snapshot для asset %d: %w", assetID, err)
+	}
+	return row.toModel(), nil
 }
 
 // --- отображения строк БД в доменные типы ---
@@ -169,10 +285,10 @@ func (r sourceRow) toModel() model.Source {
 }
 
 type assetPriceRow struct {
-	AssetID     int64          `db:"asset_id"`
-	CoinID      string         `db:"coin_id"`
-	Symbol      string         `db:"symbol"`
-	Name        string         `db:"name"`
+	AssetID     int64           `db:"asset_id"`
+	CoinID      string          `db:"coin_id"`
+	Symbol      string          `db:"symbol"`
+	Name        string          `db:"name"`
 	PriceUSD    sql.NullFloat64 `db:"price_usd"`
 	MarketCap   sql.NullFloat64 `db:"market_cap"`
 	Volume      sql.NullFloat64 `db:"volume"`
@@ -206,4 +322,30 @@ func nullTime(v sql.NullTime) time.Time {
 		return v.Time
 	}
 	return time.Time{}
+}
+
+type indicatorSnapshotRow struct {
+	ID           int64     `db:"id"`
+	AssetID      int64     `db:"asset_id"`
+	SourceID     int64     `db:"source_id"`
+	RSI          float64   `db:"rsi"`
+	ROC          float64   `db:"roc"`
+	SMA7         float64   `db:"sma_7"`
+	SMA20        float64   `db:"sma_20"`
+	VolumeSignal float64   `db:"volume_signal"`
+	CalculatedAt time.Time `db:"calculated_at"`
+}
+
+func (r indicatorSnapshotRow) toModel() model.IndicatorSnapshot {
+	return model.IndicatorSnapshot{
+		ID:           r.ID,
+		AssetID:      r.AssetID,
+		SourceID:     r.SourceID,
+		RSI:          r.RSI,
+		ROC:          r.ROC,
+		SMA7:         r.SMA7,
+		SMA20:        r.SMA20,
+		VolumeSignal: r.VolumeSignal,
+		CalculatedAt: r.CalculatedAt,
+	}
 }

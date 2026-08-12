@@ -54,13 +54,14 @@ func run() error {
 	sourcesRepo := storage.NewSources(database)
 	priceRepo := storage.NewPricePoints(database)
 	logRepo := storage.NewUpdateLog(database)
+	indicatorRepo := storage.NewIndicatorSnapshots(database)
 
 	// Worker: опрос источников в горутине.
-	wkr := worker.New(cfg, assetsRepo, sourcesRepo, priceRepo, logRepo)
+	wkr := worker.New(cfg, assetsRepo, sourcesRepo, priceRepo, logRepo, indicatorRepo)
 	go wkr.Run(rootCtx)
 
 	// HTTP-сервер.
-	srv := server.New(cfg, priceRepo)
+	srv := server.New(cfg, priceRepo, indicatorRepo)
 	httpServer := &http.Server{
 		Addr:              cfg.BackendAddr(),
 		Handler:           srv.Router(),

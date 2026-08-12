@@ -4,7 +4,9 @@
 // обновляет их по таймеру (раз в 30 секунд), чтобы UI был «живым».
 // Начальные данные приходят из серверного компонента (page.tsx), дальше
 // компонента дорасасывает обновления с бэкенда самостоятельно.
+// Карточка монеты кликабельна — ведёт на детальную страницу с индикаторами.
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import { API_URL } from "@/lib/api";
@@ -76,7 +78,11 @@ function AssetCard({ asset }: { asset: AssetPrice }) {
   const hasPrice = asset.price_usd > 0;
 
   return (
-    <li className="rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-lg backdrop-blur">
+    <li>
+      <Link
+        href={`/assets/${asset.asset_id}`}
+        className="block rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-lg backdrop-blur transition-colors hover:border-gray-600 hover:bg-gray-800/60"
+      >
       <div className="flex items-start justify-between">
         <div>
           <div className="text-lg font-bold text-white">
@@ -114,6 +120,8 @@ function AssetCard({ asset }: { asset: AssetPrice }) {
           </dd>
         </div>
       </dl>
+      <div className="mt-3 text-xs text-gray-500">индикаторы и детали →</div>
+      </Link>
     </li>
   );
 }

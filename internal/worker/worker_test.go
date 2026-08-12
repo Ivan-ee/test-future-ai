@@ -13,14 +13,26 @@ import (
 	"test-future/internal/storage"
 )
 
-// fakeTaker — тестовый источник CoinGecko: отдаёт заранее заданные монеты.
+// fakeTaker — тестовый источник CoinGecko: отдаёт заранее заданные монеты и
+// рыночные графики. Реализует coingecko.ChartTaker.
 type fakeTaker struct {
-	coins []coingecko.MarketCoin
-	err   error
+	coins  []coingecko.MarketCoin
+	err    error
+	charts map[string]coingecko.MarketChart
 }
 
 func (f fakeTaker) Markets(_ context.Context, _ []string) ([]coingecko.MarketCoin, error) {
 	return f.coins, f.err
+}
+
+func (f fakeTaker) MarketChart(_ context.Context, coinID string, _ int) (coingecko.MarketChart, error) {
+	if f.err != nil {
+		return coingecko.MarketChart{}, f.err
+	}
+	if c, ok := f.charts[coinID]; ok {
+		return c, nil
+	}
+	return coingecko.MarketChart{}, nil
 }
 
 // newWorkerDB открывает тестовую БД с сидингом.
@@ -45,6 +57,7 @@ func TestFetchOnce_WritesPointsAndLog(t *testing.T) {
 	sourcesRepo := storage.NewSources(d)
 	priceRepo := storage.NewPricePoints(d)
 	logRepo := storage.NewUpdateLog(d)
+	indRepo := storage.NewIndicatorSnapshots(d)
 
 	cfg := config.Config{FetchIntervalMin: 10}
 	taker := fakeTaker{coins: []coingecko.MarketCoin{
@@ -55,7 +68,7 @@ func TestFetchOnce_WritesPointsAndLog(t *testing.T) {
 			CurrentPrice: 3000, MarketCap: 3.6e11, TotalVolume: 1.5e10,
 			PriceChangePercentage24H: -0.5, LastUpdated: "2026-08-12T10:00:00Z"},
 	}}
-	w := NewWithTaker(cfg, taker, assetsRepo, sourcesRepo, priceRepo, logRepo)
+	w := NewWithTaker(cfg, taker, assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo)
 
 	w.fetchOnce(ctx)
 
@@ -105,6 +118,7 @@ func TestFetchOnce_SourceErrorLogged(t *testing.T) {
 		storage.NewSources(d),
 		storage.NewPricePoints(d),
 		storage.NewUpdateLog(d),
+		storage.NewIndicatorSnapshots(d),
 	)
 
 	w.fetchOnce(ctx)
@@ -147,6 +161,7 @@ func TestFetchOnce_DedupOnRetry(t *testing.T) {
 		storage.NewSources(d),
 		storage.NewPricePoints(d),
 		storage.NewUpdateLog(d),
+		storage.NewIndicatorSnapshots(d),
 	)
 
 	w.fetchOnce(ctx)
@@ -165,3 +180,104 @@ func TestFetchOnce_DedupOnRetry(t *testing.T) {
 type errFake string
 
 func (e errFake) Error() string { return string(e) }
+
+// buildMonotonicChart — рыночный график с монотонно растущим рядом из n точек
+// (цены 1..n, объёмы постоянные 1000). ts — ежедневные начиная с base.
+func buildMonotonicChart(n int, baseMs int64) coingecko.MarketChart {
+	prices := make([][2]float64, n)
+	volumes := make([][2]float64, n)
+	for i := range n {
+		ts := baseMs + int64(i)*86400000 // +1 день в мс
+		prices[i] = [2]float64{float64(ts), float64(i + 1)}
+		volumes[i] = [2]float64{float64(ts), 1000}
+	}
+	return coingecko.MarketChart{Prices: prices, TotalVolumes: volumes}
+}
+
+// TestFetchOnce_IndicatorsComputed — один цикл worker с монотонным рядом в chart:
+// в indicator_snapshots появляется снапшот с RSI≈100 (только рост).
+func TestFetchOnce_IndicatorsComputed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+
+	assetsRepo := storage.NewAssets(d)
+	sourcesRepo := storage.NewSources(d)
+	priceRepo := storage.NewPricePoints(d)
+	logRepo := storage.NewUpdateLog(d)
+	indRepo := storage.NewIndicatorSnapshots(d)
+
+	// Монотонный ряд из 25 точек → достаточно для RSI(14)/ROC(10)/SMA(20).
+	chart := buildMonotonicChart(25, 1723334400000)
+	// LastUpdated точки Markets совпадает с последней точкой chart, чтобы ряд
+	// был непрерывным; TotalVolume=1000 как в chart — корректный объём.
+	lastChartTS := "2024-09-04T00:00:00Z"
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
+				CurrentPrice: 25, TotalVolume: 1000, LastUpdated: lastChartTS},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
+		assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo)
+
+	w.fetchOnce(ctx)
+
+	snap, err := indRepo.ByAsset(ctx, 1) // bitcoin → asset_id=1 из сидинга
+	if err != nil {
+		t.Fatalf("снапшот индикаторов должен быть сохранён: %v", err)
+	}
+	// Монотонный рост → RSI≈100, ROC>0, SMA(7)>SMA(20).
+	if snap.RSI < 90 {
+		t.Errorf("RSI монотонного ряда: хотели ≈100, получили %v", snap.RSI)
+	}
+	if snap.ROC <= 0 {
+		t.Errorf("ROC монотонного ряда: хотели >0, получили %v", snap.ROC)
+	}
+	if snap.SMA7 <= snap.SMA20 {
+		t.Errorf("хотели SMA7>SMA20: получили %v и %v", snap.SMA7, snap.SMA20)
+	}
+	// VolumeSignal при постоянных объёмах → ≈1.
+	if snap.VolumeSignal < 0.99 || snap.VolumeSignal > 1.01 {
+		t.Errorf("VolumeSignal постоянного ряда: хотели ≈1, получили %v", snap.VolumeSignal)
+	}
+}
+
+// TestFetchOnce_IndicatorsSkippedOnShortSeries — если ряда слишком мало для
+// расчёта (меньше rocPeriod+1 точек), снапшот не создаётся, но цикл не падает.
+func TestFetchOnce_IndicatorsSkippedOnShortSeries(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+
+	indRepo := storage.NewIndicatorSnapshots(d)
+	// Ряд из 5 точек — меньше rocPeriod(10)+1=11, расчёт пропускается.
+	chart := buildMonotonicChart(5, 1723334400000)
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", CurrentPrice: 5, LastUpdated: "2026-08-12T10:00:00Z"},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
+		storage.NewAssets(d), storage.NewSources(d),
+		storage.NewPricePoints(d), storage.NewUpdateLog(d), indRepo)
+
+	w.fetchOnce(ctx)
+
+	// Снапшота нет — цикл корректно пропустил расчёт.
+	if _, err := indRepo.ByAsset(ctx, 1); err == nil {
+		t.Fatal("не ожидали снапшот при коротком ряде")
+	}
+
+	// Журнал при этом успешен.
+	var status string
+	if err := d.QueryRowxContext(ctx,
+		`SELECT status FROM update_log WHERE source_slug='coingecko'`).Scan(&status); err != nil {
+		t.Fatalf("select update_log: %v", err)
+	}
+	if model.UpdateStatus(status) != model.UpdateStatusOK {
+		t.Errorf("status: хотели ok, получили %s", status)
+	}
+}

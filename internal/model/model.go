@@ -48,13 +48,13 @@ const (
 
 // UpdateLog — запись истории одного цикла обновления источника.
 type UpdateLog struct {
-	ID          int64
-	SourceSlug  string    // ссылка на источник по слагу
-	Status      UpdateStatus
-	ItemsAdded  int       // сколько новых записей добавлено
-	Error       string    // текст ошибки, если status == error
-	StartedAt   time.Time
-	FinishedAt  time.Time
+	ID         int64
+	SourceSlug string // ссылка на источник по слагу
+	Status     UpdateStatus
+	ItemsAdded int    // сколько новых записей добавлено
+	Error      string // текст ошибки, если status == error
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // AssetPrice — DTO для эндпоинта GET /api/assets: актив с последней ценой.
@@ -68,4 +68,43 @@ type AssetPrice struct {
 	Volume      float64   `json:"volume"`
 	Change24H   float64   `json:"change_24h"`
 	LastUpdated time.Time `json:"last_updated"`
+}
+
+// IndicatorSnapshot — последние посчитанные технические индикаторы по монете.
+// Одна строка на актив (UPSERT по asset_id при каждом цикле worker).
+type IndicatorSnapshot struct {
+	ID           int64
+	AssetID      int64
+	SourceID     int64
+	RSI          float64 // RSI(14), 0..100
+	ROC          float64 // ROC(10), проценты
+	SMA7         float64 // SMA(7)
+	SMA20        float64 // SMA(20)
+	VolumeSignal float64 // отношение последнего объёма к среднему за 14д
+	CalculatedAt time.Time
+}
+
+// IndicatorValue — значение индикатора + человекочитаемая интерпретация.
+type IndicatorValue struct {
+	Value          float64 `json:"value"`
+	Interpretation string  `json:"interpretation"`
+}
+
+// IndicatorsView — набор индикаторов для детального эндпоинта.
+// CalculatedAt nil, если индикаторы ещё не посчитаны (null в JSON).
+type IndicatorsView struct {
+	RSI          IndicatorValue `json:"rsi"`
+	ROC          IndicatorValue `json:"roc"`
+	SMA7         IndicatorValue `json:"sma_7"`
+	SMA20        IndicatorValue `json:"sma_20"`
+	VolumeSignal IndicatorValue `json:"volume_signal"`
+	CalculatedAt *time.Time     `json:"calculated_at"`
+}
+
+// AssetDetail — DTO для эндпоинта GET /api/assets/{id}: актив с ценой и
+// последними значениями технических индикаторов. Встраивает AssetPrice, добавляя
+// блок indicators.
+type AssetDetail struct {
+	AssetPrice
+	Indicators IndicatorsView `json:"indicators"`
 }

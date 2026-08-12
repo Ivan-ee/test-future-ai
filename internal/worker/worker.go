@@ -1,9 +1,9 @@
 // Package worker реализует фоновый цикл опроса источников.
 //
-// В T1 один источник (CoinGecko) и одна задача — fetch цен по крону.
-// Worker запускается горутиной из main, опрашивает источник каждые
-// cfg.FetchIntervalMin минут, пишет точки цен (с дедупом) и фиксирует
-// результат в update_log.
+// T2: кроме текущих цен (/coins/markets), worker тянет рыночный график за 30
+// дней (/coins/{id}/market_chart) для каждой монеты, сохраняет ряды цен и
+// объёмов в price_points, считает по ним технические индикаторы (RSI/ROC/SMA/
+// VolumeSignal) и складывает последние значения в indicator_snapshots.
 package worker
 
 import (
@@ -13,24 +13,41 @@ import (
 	"time"
 
 	"test-future/internal/config"
+	"test-future/internal/indicator"
 	"test-future/internal/model"
 	"test-future/internal/source/coingecko"
 	"test-future/internal/storage"
 )
 
-// CoinGeckoTaker — контракт на сетевой источник цен для worker.
-// Совпадает с coingecko.MarketsTaker; отдельный тип держит зависимость
-// worker от конкретного источника явной.
-type CoinGeckoTaker = coingecko.MarketsTaker
+// CoinGeckoTaker — контракт на сетевой источник цен и рядов для worker.
+// Совпадает с coingecko.ChartTaker; отдельный тип держит зависимость worker
+// от конкретного источника явной.
+type CoinGeckoTaker = coingecko.ChartTaker
+
+// Параметры расчёта индикаторов (из спеки T2).
+const (
+	chartDays      = 30 // глубина рыночного графика, дней
+	rsiPeriod      = 14
+	rocPeriod      = 10
+	smaShortPeriod = 7
+	smaLongPeriod  = 20
+	volumePeriod   = 14
+	// Зона нормы VolumeSignal берётся из indicator.DefaultVolumeTolerance —
+	// единый источник правды для расчёта и интерпретации.
+	// Сколько точек ряда грузить из БД для расчёта — с запасом под самый длинный
+	// индикатор (SMA20 + RSI14 нужен 21+).
+	closesWindow = 30
+)
 
 // Worker — фоновый опросник источников.
 type Worker struct {
-	cfg        config.Config
-	taker      CoinGeckoTaker
-	assets     *storage.Assets
-	sources    *storage.Sources
-	priceStore *storage.PricePoints
-	logStore   *storage.UpdateLog
+	cfg            config.Config
+	taker          CoinGeckoTaker
+	assets         *storage.Assets
+	sources        *storage.Sources
+	priceStore     *storage.PricePoints
+	logStore       *storage.UpdateLog
+	indicatorStore *storage.IndicatorSnapshots
 }
 
 // New создаёт worker с реальным клиентом CoinGecko.
@@ -40,8 +57,9 @@ func New(
 	sources *storage.Sources,
 	priceStore *storage.PricePoints,
 	logStore *storage.UpdateLog,
+	indicatorStore *storage.IndicatorSnapshots,
 ) *Worker {
-	return NewWithTaker(cfg, coingecko.New(cfg.CoinGeckoBaseURL), assets, sources, priceStore, logStore)
+	return NewWithTaker(cfg, coingecko.New(cfg.CoinGeckoBaseURL), assets, sources, priceStore, logStore, indicatorStore)
 }
 
 // NewWithTaker позволяет внедрить тестовую/моковую реализацию источника.
@@ -52,14 +70,16 @@ func NewWithTaker(
 	sources *storage.Sources,
 	priceStore *storage.PricePoints,
 	logStore *storage.UpdateLog,
+	indicatorStore *storage.IndicatorSnapshots,
 ) *Worker {
 	return &Worker{
-		cfg:        cfg,
-		taker:      taker,
-		assets:     assets,
-		sources:    sources,
-		priceStore: priceStore,
-		logStore:   logStore,
+		cfg:            cfg,
+		taker:          taker,
+		assets:         assets,
+		sources:        sources,
+		priceStore:     priceStore,
+		logStore:       logStore,
+		indicatorStore: indicatorStore,
 	}
 }
 
@@ -134,8 +154,91 @@ func (w *Worker) fetchOnce(ctx context.Context) {
 		}
 	}
 
+	// T2: рыночные графики за 30 дней + расчёт индикаторов по каждой монете.
+	for coinID, asset := range byID {
+		if err := w.fetchChartAndIndicators(ctx, asset, coinID, src.ID); err != nil {
+			// Ошибка на одной монете не валит весь цикл.
+			log.Printf("worker: индикаторы для %s: %v", coinID, err)
+		}
+	}
+
 	w.logCycle(ctx, started, model.UpdateStatusOK, added, nil)
 	log.Printf("worker: цикл CoinGecko завершён, добавлено новых точек: %d", added)
+}
+
+// fetchChartAndIndicators тянет рыночный график монеты за chartDays дней,
+// сохраняет ряды цен/объёмов в price_points, затем считает индикаторы по данным
+// из БД (единый источник правды) и сохраняет снапшот в indicator_snapshots.
+func (w *Worker) fetchChartAndIndicators(ctx context.Context, asset model.Asset, coinID string, sourceID int64) error {
+	chart, err := w.taker.MarketChart(ctx, coinID, chartDays)
+	if err != nil {
+		return fmt.Errorf("market_chart %s: %w", coinID, err)
+	}
+
+	// Сохраняем исторический ряд в price_points (дедуп обеспечит InsertOne).
+	chartPoints := coingecko.ChartMap(chart, asset.ID, sourceID)
+	for _, p := range chartPoints {
+		if _, err := w.priceStore.InsertOne(ctx, p); err != nil {
+			log.Printf("worker: вставка chart-point для asset %d: %v", asset.ID, err)
+		}
+	}
+
+	// Грузим ряды из БД — единый источник правды для индикаторов.
+	closes, err := w.priceStore.LastClosesByAsset(ctx, asset.ID, closesWindow)
+	if err != nil {
+		return fmt.Errorf("выборка closes asset %d: %w", asset.ID, err)
+	}
+	volumes, err := w.priceStore.LastVolumesByAsset(ctx, asset.ID, closesWindow)
+	if err != nil {
+		return fmt.Errorf("выборка volumes asset %d: %w", asset.ID, err)
+	}
+
+	// RSI и ROC требуют минимум period+1 точек. Если данных мало — пропускаем
+	// (на первых циклах ряда может не хватать).
+	if len(closes) < rocPeriod+1 {
+		return nil
+	}
+
+	rsi, err := indicator.RSI(closes, rsiPeriod)
+	if err != nil {
+		return fmt.Errorf("RSI asset %d: %w", asset.ID, err)
+	}
+	roc, err := indicator.ROC(closes, rocPeriod)
+	if err != nil {
+		return fmt.Errorf("ROC asset %d: %w", asset.ID, err)
+	}
+	sma7, err := indicator.SMA(closes, smaShortPeriod)
+	if err != nil {
+		return fmt.Errorf("SMA7 asset %d: %w", asset.ID, err)
+	}
+	sma20, err := indicator.SMA(closes, smaLongPeriod)
+	if err != nil {
+		return fmt.Errorf("SMA20 asset %d: %w", asset.ID, err)
+	}
+
+	// VolumeSignal требует минимум volumePeriod точек; если данных мало — 0.
+	volSignal := 0.0
+	if len(volumes) >= volumePeriod {
+		volSignal, err = indicator.VolumeSignal(volumes, volumePeriod, indicator.DefaultVolumeTolerance)
+		if err != nil {
+			log.Printf("worker: VolumeSignal asset %d: %v", asset.ID, err)
+		}
+	}
+
+	snap := model.IndicatorSnapshot{
+		AssetID:      asset.ID,
+		SourceID:     sourceID,
+		RSI:          rsi,
+		ROC:          roc,
+		SMA7:         sma7,
+		SMA20:        sma20,
+		VolumeSignal: volSignal,
+		CalculatedAt: time.Now().UTC(),
+	}
+	if err := w.indicatorStore.Upsert(ctx, snap); err != nil {
+		return fmt.Errorf("upsert indicators asset %d: %w", asset.ID, err)
+	}
+	return nil
 }
 
 // logCycle фиксирует результат цикла в update_log, приводя ошибку к тексту.

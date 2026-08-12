@@ -50,3 +50,9 @@ export function formatTime(iso: string | null): string {
     return iso;
   }
 }
+
+/** Значение индикатора с заданной точностью: «72.30» или «—» для 0/пусто. */
+export function formatIndicator(value: number, decimals = 2): string {
+  if (!value && value !== 0) return "—";
+  return value.toFixed(decimals);
+}

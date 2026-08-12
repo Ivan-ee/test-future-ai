@@ -128,3 +128,85 @@ func TestMarketMap_EmptyInput(t *testing.T) {
 		t.Fatalf("хотели 0 точек, получили %d", len(points))
 	}
 }
+
+// --- ChartMap ---
+
+// TestChartMap_HappyPath — корректный маппинг [ts_ms, value] в точки цен:
+// timestamp из миллисекунд, цена и объём сопоставлены по индексу.
+func TestChartMap_HappyPath(t *testing.T) {
+	t.Parallel()
+	chart := MarketChart{
+		Prices: [][2]float64{
+			{1723334400000, 60000}, // 2024-08-11T00:00:00Z
+			{1723420800000, 61000}, // 2024-08-12T00:00:00Z
+		},
+		TotalVolumes: [][2]float64{
+			{1723334400000, 30_000_000_000},
+			{1723420800000, 32_000_000_000},
+		},
+	}
+
+	points := ChartMap(chart, 1, 99)
+	if len(points) != 2 {
+		t.Fatalf("хотели 2 точки, получили %d", len(points))
+	}
+
+	wantTS := time.Date(2024, 8, 11, 0, 0, 0, 0, time.UTC)
+	if !points[0].TS.Equal(wantTS) {
+		t.Errorf("TS[0]: хотели %v, получили %v", wantTS, points[0].TS)
+	}
+	if points[0].PriceUSD != 60000 {
+		t.Errorf("Price[0]: хотели 60000, получили %v", points[0].PriceUSD)
+	}
+	if points[0].Volume != 30_000_000_000 {
+		t.Errorf("Volume[0]: хотели 30e9, получили %v", points[0].Volume)
+	}
+	if points[1].PriceUSD != 61000 {
+		t.Errorf("Price[1]: хотели 61000, получили %v", points[1].PriceUSD)
+	}
+	if points[1].AssetID != 1 || points[1].SourceID != 99 {
+		t.Errorf("ключи: AssetID=%d SourceID=%d", points[1].AssetID, points[1].SourceID)
+	}
+}
+
+// TestChartMap_VolumesShorterThanPrices — если ряд объёмов короче цен,
+// недостающие объёмы заполняются нулём (точка остаётся).
+func TestChartMap_VolumesShorterThanPrices(t *testing.T) {
+	t.Parallel()
+	chart := MarketChart{
+		Prices: [][2]float64{
+			{1723334400000, 60000},
+			{1723420800000, 61000},
+			{1723507200000, 62000},
+		},
+		TotalVolumes: [][2]float64{
+			{1723334400000, 30e9}, // только одна
+		},
+	}
+
+	points := ChartMap(chart, 1, 1)
+	if len(points) != 3 {
+		t.Fatalf("хотели 3 точки, получили %d", len(points))
+	}
+	if points[0].Volume != 30e9 {
+		t.Errorf("Volume[0]: хотели 30e9, получили %v", points[0].Volume)
+	}
+	if points[1].Volume != 0 {
+		t.Errorf("Volume[1]: хотели 0 (нет в ряде), получили %v", points[1].Volume)
+	}
+	if points[2].Volume != 0 {
+		t.Errorf("Volume[2]: хотели 0 (нет в ряде), получили %v", points[2].Volume)
+	}
+	if points[2].PriceUSD != 62000 {
+		t.Errorf("Price[2]: хотели 62000, получили %v", points[2].PriceUSD)
+	}
+}
+
+// TestChartMap_EmptyChart — пустой ответ не паникует, отдаёт пустой срез.
+func TestChartMap_EmptyChart(t *testing.T) {
+	t.Parallel()
+	points := ChartMap(MarketChart{}, 1, 1)
+	if len(points) != 0 {
+		t.Fatalf("хотели 0 точек, получили %d", len(points))
+	}
+}

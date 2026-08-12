@@ -16,12 +16,12 @@ import (
 
 // Config — конфигурация приложения.
 type Config struct {
-	OpenAIAPIKey      string
-	CoinGeckoBaseURL  string
-	BackendPort       int
-	FrontendPort      int
-	DBPath            string
-	FetchIntervalMin  int // период опроса источников, минут (по умолчанию 10)
+	OpenAIAPIKey     string
+	CoinGeckoBaseURL string
+	BackendPort      int
+	FrontendPort     int
+	DBPath           string
+	FetchIntervalMin int // период опроса источников, минут (по умолчанию 10)
 }
 
 // Load загружает конфигурацию: сначала пробует .env в корне репозитория, затем

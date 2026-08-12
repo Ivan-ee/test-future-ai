@@ -50,3 +50,18 @@ CREATE TABLE IF NOT EXISTS update_log (
 
 CREATE INDEX IF NOT EXISTS idx_update_log_source_started
     ON update_log (source_slug, started_at DESC);
+
+-- Снапшоты посчитанных индикаторов: одна строка на актив (последние значения).
+-- T2: RSI(14), ROC(10), SMA(7), SMA(20), VolumeSignal(14д).
+-- UPSERT по asset_id при каждом цикле worker — храним только актуальный срез.
+CREATE TABLE IF NOT EXISTS indicator_snapshots (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id       INTEGER NOT NULL UNIQUE REFERENCES assets(id),  -- одна строка на монету
+    source_id      INTEGER NOT NULL REFERENCES sources(id),
+    rsi            REAL     NOT NULL DEFAULT 0,
+    roc            REAL     NOT NULL DEFAULT 0,
+    sma_7          REAL     NOT NULL DEFAULT 0,
+    sma_20         REAL     NOT NULL DEFAULT 0,
+    volume_signal  REAL     NOT NULL DEFAULT 0,
+    calculated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
