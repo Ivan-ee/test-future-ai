@@ -4,6 +4,10 @@
 // дней (/coins/{id}/market_chart) для каждой монеты, сохраняет ряды цен и
 // объёмов в price_points, считает по ним технические индикаторы (RSI/ROC/SMA/
 // VolumeSignal) и складывает последние значения в indicator_snapshots.
+//
+// T3: отдельный цикл прогноза (раз в час) читает индикаторы, считает прогноз
+// «вверх/вниз за 24ч» через scoring.Forecast и сохраняет результат + декомпозицию
+// по факторам в forecasts / forecast_factors.
 package worker
 
 import (
@@ -15,6 +19,7 @@ import (
 	"test-future/internal/config"
 	"test-future/internal/indicator"
 	"test-future/internal/model"
+	"test-future/internal/scoring"
 	"test-future/internal/source/coingecko"
 	"test-future/internal/storage"
 )
@@ -37,6 +42,8 @@ const (
 	// Сколько точек ряда грузить из БД для расчёта — с запасом под самый длинный
 	// индикатор (SMA20 + RSI14 нужен 21+).
 	closesWindow = 30
+	// forecastInterval — период пересчёта прогнозов. По спеке T3 — раз в час.
+	forecastInterval = time.Hour
 )
 
 // Worker — фоновый опросник источников.
@@ -48,6 +55,7 @@ type Worker struct {
 	priceStore     *storage.PricePoints
 	logStore       *storage.UpdateLog
 	indicatorStore *storage.IndicatorSnapshots
+	forecastStore  *storage.Forecasts
 }
 
 // New создаёт worker с реальным клиентом CoinGecko.
@@ -58,8 +66,9 @@ func New(
 	priceStore *storage.PricePoints,
 	logStore *storage.UpdateLog,
 	indicatorStore *storage.IndicatorSnapshots,
+	forecastStore *storage.Forecasts,
 ) *Worker {
-	return NewWithTaker(cfg, coingecko.New(cfg.CoinGeckoBaseURL), assets, sources, priceStore, logStore, indicatorStore)
+	return NewWithTaker(cfg, coingecko.New(cfg.CoinGeckoBaseURL), assets, sources, priceStore, logStore, indicatorStore, forecastStore)
 }
 
 // NewWithTaker позволяет внедрить тестовую/моковую реализацию источника.
@@ -71,6 +80,7 @@ func NewWithTaker(
 	priceStore *storage.PricePoints,
 	logStore *storage.UpdateLog,
 	indicatorStore *storage.IndicatorSnapshots,
+	forecastStore *storage.Forecasts,
 ) *Worker {
 	return &Worker{
 		cfg:            cfg,
@@ -80,30 +90,37 @@ func NewWithTaker(
 		priceStore:     priceStore,
 		logStore:       logStore,
 		indicatorStore: indicatorStore,
+		forecastStore:  forecastStore,
 	}
 }
 
 // Run блокирует до отмены ctx, опрашивая источник по расписанию.
 // Первый опрос выполняется сразу (чтобы UI показал данные без ожидания).
+// Отдельным тикером раз в forecastInterval пересчитываются прогнозы.
 func (w *Worker) Run(ctx context.Context) {
 	interval := time.Duration(w.cfg.FetchIntervalMin) * time.Minute
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	log.Printf("worker: запуск, интервал опроса %v", interval)
+	log.Printf("worker: запуск, интервал опроса %v, прогнозов — %v", interval, forecastInterval)
 
-	// Сразу — один цикл, дальше по тикеру.
+	// Сразу — один цикл цен/индикаторов, затем прогноз (нужны свежие индикаторы).
 	w.fetchOnce(ctx)
+	w.computeForecasts(ctx)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	priceTicker := time.NewTicker(interval)
+	forecastTicker := time.NewTicker(forecastInterval)
+	defer priceTicker.Stop()
+	defer forecastTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("worker: остановлен")
 			return
-		case <-t.C:
+		case <-priceTicker.C:
 			w.fetchOnce(ctx)
+		case <-forecastTicker.C:
+			w.computeForecasts(ctx)
 		}
 	}
 }
@@ -256,4 +273,74 @@ func (w *Worker) logCycle(ctx context.Context, started time.Time, status model.U
 	if logErr := w.logStore.Record(ctx, entry); logErr != nil {
 		log.Printf("worker: не удалось записать update_log: %v", logErr)
 	}
+}
+
+// computeForecasts пересчитывает прогнозы по всем активам: читает последние
+// индикаторы, считает scoring.Forecast и сохраняет результат с декомпозицией
+// по факторам. Ошибка на одной монете не валит весь цикл.
+func (w *Worker) computeForecasts(ctx context.Context) {
+	assets, err := w.assets.All(ctx)
+	if err != nil {
+		log.Printf("worker: прогнозы — выборка assets: %v", err)
+		return
+	}
+
+	saved := 0
+	for _, asset := range assets {
+		if err := w.computeOneForecast(ctx, asset); err != nil {
+			log.Printf("worker: прогноз для %s: %v", asset.CoinID, err)
+			continue
+		}
+		saved++
+	}
+	log.Printf("worker: прогнозы пересчитаны, сохранено: %d", saved)
+}
+
+// computeOneForecast считает и сохраняет прогноз для одного актива.
+func (w *Worker) computeOneForecast(ctx context.Context, asset model.Asset) error {
+	snap, err := w.indicatorStore.ByAsset(ctx, asset.ID)
+	if err != nil {
+		// Индикаторы ещё не посчитаны — пропускаем (появятся после первого цикла).
+		return fmt.Errorf("индикаторы для asset %d: %w", asset.ID, err)
+	}
+
+	in := scoring.IndicatorInput{
+		RSI:          snap.RSI,
+		ROC:          snap.ROC,
+		SMA7:         snap.SMA7,
+		SMA20:        snap.SMA20,
+		VolumeSignal: snap.VolumeSignal,
+	}
+	factors := scoring.FactorsFromIndicators(in, indicator.DefaultVolumeTolerance)
+	result := scoring.Forecast(factors, nil)
+
+	// Собираем доменную модель для сохранения.
+	now := time.Now().UTC()
+	forecast := model.Forecast{
+		AssetID:      asset.ID,
+		CreatedAt:    now,
+		HorizonHours: scoring.Horizon,
+		Direction:    string(result.Direction),
+		Confidence:   result.Confidence,
+		RiskNote:     result.RiskNote,
+		ArgumentText: result.ArgumentText,
+		RawScore:     result.RawScore,
+		Status:       model.ForecastStatusActive,
+	}
+	forecastFactors := make([]model.ForecastFactor, 0, len(result.Factors))
+	for _, f := range result.Factors {
+		forecastFactors = append(forecastFactors, model.ForecastFactor{
+			Name:           string(f.Name),
+			Signal:         f.Signal,
+			BaseWeight:     f.BaseWeight,
+			AdjustedWeight: f.AdjustedWeight,
+			Contribution:   f.Contribution,
+			Detail:         f.Detail,
+		})
+	}
+
+	if _, err := w.forecastStore.Save(ctx, storage.SavePersisted{Forecast: forecast, Factors: forecastFactors}); err != nil {
+		return fmt.Errorf("сохранение прогноза asset %d: %w", asset.ID, err)
+	}
+	return nil
 }

@@ -108,3 +108,92 @@ type AssetDetail struct {
 	AssetPrice
 	Indicators IndicatorsView `json:"indicators"`
 }
+
+// ForecastStatus — статус прогноза: active (актуальный), superseded (заменён
+// более свежим — история остаётся для аудита формулы).
+type ForecastStatus string
+
+const (
+	ForecastStatusActive     ForecastStatus = "active"
+	ForecastStatusSuperseded ForecastStatus = "superseded"
+)
+
+// Forecast — запись прогноза «вверх/вниз за 24ч» по активу на момент времени.
+// Одна строка на цикл пересчёта; статус active у последнего, остальные —
+// superseded (история для аудита формулы).
+type Forecast struct {
+	ID           int64
+	AssetID      int64
+	CreatedAt    time.Time
+	HorizonHours int            // горизонт прогноза (24)
+	Direction    string         // "up" | "down"
+	Confidence   float64        // [0.5, 1.0]
+	RiskNote     string         // короткая заметка о риске
+	ArgumentText string         // детерминированная текстовая аргументация
+	RawScore     float64        // Σ(signal × adjusted_weight)
+	Status       ForecastStatus // active | superseded
+}
+
+// ForecastFactor — декомпозиция вклада одного фактора в прогноз. Хранится
+// отдельно для прозрачности: какой сигнал, какой вес, какой вклад.
+type ForecastFactor struct {
+	ID             int64
+	ForecastID     int64
+	Name           string  // "rsi" | "momentum" | "volume"
+	Signal         float64 // [-1..1]
+	BaseWeight     float64 // исходный вес до нормировки
+	AdjustedWeight float64 // нормированный вес (сумма по факторам = 1.0)
+	Contribution   float64 // signal × adjusted_weight
+	Detail         string  // описание значений, использованных для сигнала
+}
+
+// ForecastFactorView — DTO факторa в ответе API.
+type ForecastFactorView struct {
+	Name           string  `json:"name"`
+	Signal         float64 `json:"signal"`
+	BaseWeight     float64 `json:"base_weight"`
+	AdjustedWeight float64 `json:"adjusted_weight"`
+	Contribution   float64 `json:"contribution"`
+	Detail         string  `json:"detail"`
+}
+
+// ForecastDataView — «использованные данные»: сырые значения, из которых
+// считались сигналы факторов. Помогает пользователю понять, откуда прогноз.
+type ForecastDataView struct {
+	PriceUSD     float64    `json:"price_usd"`
+	RSI          float64    `json:"rsi"`
+	ROC          float64    `json:"roc"`
+	SMA7         float64    `json:"sma_7"`
+	SMA20        float64    `json:"sma_20"`
+	VolumeSignal float64    `json:"volume_signal"`
+	Change24H    float64    `json:"change_24h"`
+	CalculatedAt *time.Time `json:"calculated_at"` // время расчёта индикаторов
+}
+
+// ForecastView — DTO для эндпоинта GET /api/forecasts/:asset: полный прогноз
+// с декомпозицией по факторам и использованными данными.
+type ForecastView struct {
+	AssetID      int64                `json:"asset_id"`
+	Symbol       string               `json:"symbol"`
+	Name         string               `json:"name"`
+	CreatedAt    time.Time            `json:"created_at"`
+	HorizonHours int                  `json:"horizon_hours"`
+	Direction    string               `json:"direction"`
+	Confidence   float64              `json:"confidence"`
+	RiskNote     string               `json:"risk_note"`
+	ArgumentText string               `json:"argument_text"`
+	RawScore     float64              `json:"raw_score"`
+	Factors      []ForecastFactorView `json:"factors"`
+	Data         ForecastDataView     `json:"data"`
+}
+
+// ForecastSummary — краткий прогноз для списка и главной страницы:
+// направление + уверенность + когда посчитан.
+type ForecastSummary struct {
+	AssetID    int64     `json:"asset_id"`
+	Symbol     string    `json:"symbol"`
+	Name       string    `json:"name"`
+	Direction  string    `json:"direction"`
+	Confidence float64   `json:"confidence"`
+	CreatedAt  time.Time `json:"created_at"`
+}

@@ -1,35 +1,42 @@
 "use client";
 
 // AssetList — клиентская компонента: показывает список монет с ценами и
-// обновляет их по таймеру (раз в 30 секунд), чтобы UI был «живым».
+// прогнозами, обновляет их по таймеру (раз в 30 секунд), чтобы UI был «живым».
 // Начальные данные приходят из серверного компонента (page.tsx), дальше
 // компонента дорасасывает обновления с бэкенда самостоятельно.
-// Карточка монеты кликабельна — ведёт на детальную страницу с индикаторами.
+// Карточка монеты кликабельна — ведёт на детальную страницу прогноза.
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import { API_URL } from "@/lib/api";
-import { formatChange, formatCompact, formatPrice, formatTime } from "@/lib/format";
-import type { AssetPrice } from "@/lib/types";
+import { formatChange, formatCompact, formatPercent, formatPrice, formatTime } from "@/lib/format";
+import type { AssetPrice, ForecastSummary } from "@/lib/types";
 
 interface Props {
-  initial: AssetPrice[];
+  initialAssets: AssetPrice[];
+  initialForecasts: ForecastSummary[];
 }
 
 const REFRESH_MS = 30_000;
 
-export default function AssetList({ initial }: Props) {
-  const [items, setItems] = useState<AssetPrice[]>(initial);
+export default function AssetList({ initialAssets, initialForecasts }: Props) {
+  const [items, setItems] = useState<AssetPrice[]>(initialAssets);
+  const [forecasts, setForecasts] = useState<ForecastSummary[]>(initialForecasts);
   const [error, setError] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<Date>(new Date());
 
   const refresh = useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/api/assets`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data: AssetPrice[] = await res.json();
-      setItems(data);
+      const [assetsRes, fcRes] = await Promise.all([
+        fetch(`${API_URL}/api/assets`, { cache: "no-store" }),
+        fetch(`${API_URL}/api/forecasts`, { cache: "no-store" }).catch(() => null),
+      ]);
+      if (!assetsRes.ok) throw new Error(`HTTP ${assetsRes.status}`);
+      setItems((await assetsRes.json()) as AssetPrice[]);
+      if (fcRes && fcRes.ok) {
+        setForecasts((await fcRes.json()) as ForecastSummary[]);
+      }
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -42,6 +49,9 @@ export default function AssetList({ initial }: Props) {
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  // map asset_id → прогноз для быстрого поиска в карточке.
+  const fcByAsset = new Map(forecasts.map((f) => [f.asset_id, f]));
 
   return (
     <section>
@@ -65,14 +75,14 @@ export default function AssetList({ initial }: Props) {
 
       <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {items.map((a) => (
-          <AssetCard key={a.coin_id} asset={a} />
+          <AssetCard key={a.coin_id} asset={a} forecast={fcByAsset.get(a.asset_id)} />
         ))}
       </ul>
     </section>
   );
 }
 
-function AssetCard({ asset }: { asset: AssetPrice }) {
+function AssetCard({ asset, forecast }: { asset: AssetPrice; forecast?: ForecastSummary }) {
   const change = asset.change_24h;
   const up = change >= 0;
   const hasPrice = asset.price_usd > 0;
@@ -80,7 +90,7 @@ function AssetCard({ asset }: { asset: AssetPrice }) {
   return (
     <li>
       <Link
-        href={`/assets/${asset.asset_id}`}
+        href={`/forecasts/${asset.asset_id}`}
         className="block rounded-xl border border-gray-800 bg-gray-900/60 p-4 shadow-lg backdrop-blur transition-colors hover:border-gray-600 hover:bg-gray-800/60"
       >
       <div className="flex items-start justify-between">
@@ -95,14 +105,40 @@ function AssetCard({ asset }: { asset: AssetPrice }) {
             {formatPrice(asset.price_usd)}
           </div>
         </div>
-        <span
-          className={`rounded-md px-2 py-1 text-sm font-medium ${
-            up ? "bg-green-900/40 text-green-400" : "bg-red-900/40 text-red-400"
-          }`}
-        >
-          {formatChange(change)}
-        </span>
+        <div className="flex flex-col items-end gap-1">
+          <span
+            className={`rounded-md px-2 py-1 text-sm font-medium ${
+              up ? "bg-green-900/40 text-green-400" : "bg-red-900/40 text-red-400"
+            }`}
+          >
+            {formatChange(change)}
+          </span>
+          {forecast ? (
+            <ForecastBadge direction={forecast.direction} confidence={forecast.confidence} />
+          ) : null}
+        </div>
       </div>
+
+      {/* Прогноз крупно, если есть */}
+      {forecast ? (
+        <div className="mt-3 flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2">
+          <span className={`text-2xl font-bold ${forecast.direction === "up" ? "text-green-400" : "text-red-400"}`}>
+            {forecast.direction === "up" ? "↑" : "↓"}
+          </span>
+          <div className="text-sm">
+            <span className="text-gray-300">
+              Прогноз 24ч: <span className="font-medium">{forecast.direction === "up" ? "вверх" : "вниз"}</span>
+            </span>
+            <span className="ml-2 text-gray-500">
+              уверенность {formatPercent(forecast.confidence)}
+            </span>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 text-xs text-gray-600">
+          прогноз ещё не посчитан — загляните позже
+        </div>
+      )}
 
       <dl className="mt-4 grid grid-cols-2 gap-2 text-sm text-gray-400">
         <div>
@@ -120,8 +156,23 @@ function AssetCard({ asset }: { asset: AssetPrice }) {
           </dd>
         </div>
       </dl>
-      <div className="mt-3 text-xs text-gray-500">индикаторы и детали →</div>
+      <div className="mt-3 text-xs text-gray-500">прогноз и детали →</div>
       </Link>
     </li>
+  );
+}
+
+// ForecastBadge — компактный бейдж направления прогноза для угла карточки.
+function ForecastBadge({ direction, confidence }: { direction: string; confidence: number }) {
+  const isUp = direction === "up";
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-xs font-medium ${
+        isUp ? "bg-green-950/60 text-green-500" : "bg-red-950/60 text-red-500"
+      }`}
+      title={`Прогноз 24ч: ${isUp ? "вверх" : "вниз"}, уверенность ${formatPercent(confidence)}`}
+    >
+      {isUp ? "↑" : "↓"} {formatPercent(confidence)}
+    </span>
   );
 }

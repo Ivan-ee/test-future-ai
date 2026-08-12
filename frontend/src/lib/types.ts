@@ -33,3 +33,53 @@ export interface IndicatorsView {
 export interface AssetDetail extends AssetPrice {
   indicators: IndicatorsView;
 }
+
+// --- Прогнозы (T3) ---
+
+/** Краткий прогноз для списка и главной — ответ GET /api/forecasts. */
+export interface ForecastSummary {
+  asset_id: number;
+  symbol: string;
+  name: string;
+  direction: "up" | "down";
+  confidence: number; // [0.5, 1.0]
+  created_at: string; // ISO-дата
+}
+
+/** Декомпозиция вклада фактора в прогноз. */
+export interface ForecastFactorView {
+  name: string; // "rsi" | "momentum" | "volume"
+  signal: number; // [-1, 1]
+  base_weight: number;
+  adjusted_weight: number;
+  contribution: number; // signal × adjusted_weight
+  detail: string;
+}
+
+/** Использованные данные — сырые значения, из которых считались сигналы. */
+export interface ForecastDataView {
+  price_usd: number;
+  rsi: number;
+  roc: number;
+  sma_7: number;
+  sma_20: number;
+  volume_signal: number;
+  change_24h: number;
+  calculated_at: string | null;
+}
+
+/** Детальная карточка прогноза — ответ GET /api/forecasts/:asset. */
+export interface ForecastView {
+  asset_id: number;
+  symbol: string;
+  name: string;
+  created_at: string;
+  horizon_hours: number;
+  direction: "up" | "down";
+  confidence: number;
+  risk_note: string;
+  argument_text: string;
+  raw_score: number;
+  factors: ForecastFactorView[];
+  data: ForecastDataView;
+}

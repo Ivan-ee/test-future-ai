@@ -65,3 +65,40 @@ CREATE TABLE IF NOT EXISTS indicator_snapshots (
     volume_signal  REAL     NOT NULL DEFAULT 0,
     calculated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Прогнозы «вверх/вниз за 24ч» по активу (T3).
+-- Каждый цикл пересчёта добавляет новую строку; предыдущий активный прогноз
+-- переводится в статус superseded (история для аудита формулы).
+CREATE TABLE IF NOT EXISTS forecasts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id       INTEGER NOT NULL REFERENCES assets(id),
+    created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    horizon_hours  INTEGER NOT NULL DEFAULT 24,
+    direction      TEXT    NOT NULL,                -- "up" | "down"
+    confidence     REAL    NOT NULL,                -- [0.5, 1.0]
+    risk_note      TEXT    NOT NULL DEFAULT '',
+    argument_text  TEXT    NOT NULL DEFAULT '',
+    raw_score      REAL    NOT NULL,
+    status         TEXT    NOT NULL DEFAULT 'active' -- "active" | "superseded"
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecasts_asset_created
+    ON forecasts (asset_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_forecasts_status
+    ON forecasts (status);
+
+-- Декомпозиция вклада факторов в прогноз (T3). Прозрачность формулы: какой
+-- сигнал, какой вес (базовый и нормированный), какой вклад и описание.
+CREATE TABLE IF NOT EXISTS forecast_factors (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    forecast_id      INTEGER NOT NULL REFERENCES forecasts(id) ON DELETE CASCADE,
+    name             TEXT    NOT NULL,               -- "rsi" | "momentum" | "volume"
+    signal           REAL    NOT NULL,               -- [-1..1]
+    base_weight      REAL    NOT NULL,
+    adjusted_weight  REAL    NOT NULL,
+    contribution     REAL    NOT NULL,               -- signal × adjusted_weight
+    detail           TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_factors_forecast
+    ON forecast_factors (forecast_id);

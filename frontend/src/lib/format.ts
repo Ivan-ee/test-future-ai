@@ -56,3 +56,8 @@ export function formatIndicator(value: number, decimals = 2): string {
   if (!value && value !== 0) return "—";
   return value.toFixed(decimals);
 }
+
+/** Доля [0..1] как проценты: 0.68 → «68%». Для confidence прогноза. */
+export function formatPercent(fraction: number): string {
+  return `${(fraction * 100).toFixed(0)}%`;
+}

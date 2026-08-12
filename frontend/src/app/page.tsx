@@ -1,18 +1,22 @@
 // Главная страница — серверный компонент (App Router).
-// Начальные данные тянет с бэкенда через server-side fetch; автообновление
-// раз в 30 секунд делает клиентская компонента AssetList.
+// Начальные данные (цены + прогнозы) тянет с бэкенда через server-side fetch;
+// автообновление раз в 30 секунд делает клиентская компонента AssetList.
 
-import { fetchAssets } from "@/lib/api";
+import { fetchAssets, fetchForecasts } from "@/lib/api";
 import AssetList from "@/components/AssetList";
 
 export const dynamic = "force-dynamic"; // всегда свежие цены при загрузке
 
 export default async function HomePage() {
-  let initial: Awaited<ReturnType<typeof fetchAssets>> = [];
+  let initialAssets: Awaited<ReturnType<typeof fetchAssets>> = [];
+  let initialForecasts: Awaited<ReturnType<typeof fetchForecasts>> = [];
   let loadError: string | null = null;
 
   try {
-    initial = await fetchAssets();
+    [initialAssets, initialForecasts] = await Promise.all([
+      fetchAssets(),
+      fetchForecasts().catch(() => [] as Awaited<ReturnType<typeof fetchForecasts>>),
+    ]);
   } catch (e) {
     loadError = e instanceof Error ? e.message : String(e);
   }
@@ -22,9 +26,9 @@ export default async function HomePage() {
       <header className="mb-10">
         <h1 className="text-3xl font-bold text-white">test-future</h1>
         <p className="mt-2 text-gray-400">
-          Live-цены криптовалют из CoinGecko и технические индикаторы (RSI/ROC/
-          SMA/объём). Кликните по монете, чтобы увидеть посчитанные индикаторы и
-          их интерпретацию. Прогнозы появятся позже.
+          Live-цены криптовалют из CoinGecko, технические индикаторы (RSI/ROC/
+          SMA/объём) и прозрачные прогнозы «вверх/вниз за 24ч». Прогноз считается
+          детерминированно из сохранённых индикаторов по понятной формуле.
         </p>
       </header>
 
@@ -34,7 +38,7 @@ export default async function HomePage() {
           бэкенд запущен (make dev).
         </div>
       ) : (
-        <AssetList initial={initial} />
+        <AssetList initialAssets={initialAssets} initialForecasts={initialForecasts} />
       )}
     </main>
   );

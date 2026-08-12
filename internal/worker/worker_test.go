@@ -68,7 +68,7 @@ func TestFetchOnce_WritesPointsAndLog(t *testing.T) {
 			CurrentPrice: 3000, MarketCap: 3.6e11, TotalVolume: 1.5e10,
 			PriceChangePercentage24H: -0.5, LastUpdated: "2026-08-12T10:00:00Z"},
 	}}
-	w := NewWithTaker(cfg, taker, assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo)
+	w := NewWithTaker(cfg, taker, assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo, storage.NewForecasts(d))
 
 	w.fetchOnce(ctx)
 
@@ -119,6 +119,7 @@ func TestFetchOnce_SourceErrorLogged(t *testing.T) {
 		storage.NewPricePoints(d),
 		storage.NewUpdateLog(d),
 		storage.NewIndicatorSnapshots(d),
+		storage.NewForecasts(d),
 	)
 
 	w.fetchOnce(ctx)
@@ -162,6 +163,7 @@ func TestFetchOnce_DedupOnRetry(t *testing.T) {
 		storage.NewPricePoints(d),
 		storage.NewUpdateLog(d),
 		storage.NewIndicatorSnapshots(d),
+		storage.NewForecasts(d),
 	)
 
 	w.fetchOnce(ctx)
@@ -220,7 +222,7 @@ func TestFetchOnce_IndicatorsComputed(t *testing.T) {
 		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
 	}
 	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
-		assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo)
+		assetsRepo, sourcesRepo, priceRepo, logRepo, indRepo, storage.NewForecasts(d))
 
 	w.fetchOnce(ctx)
 
@@ -262,7 +264,7 @@ func TestFetchOnce_IndicatorsSkippedOnShortSeries(t *testing.T) {
 	}
 	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
 		storage.NewAssets(d), storage.NewSources(d),
-		storage.NewPricePoints(d), storage.NewUpdateLog(d), indRepo)
+		storage.NewPricePoints(d), storage.NewUpdateLog(d), indRepo, storage.NewForecasts(d))
 
 	w.fetchOnce(ctx)
 
@@ -279,5 +281,97 @@ func TestFetchOnce_IndicatorsSkippedOnShortSeries(t *testing.T) {
 	}
 	if model.UpdateStatus(status) != model.UpdateStatusOK {
 		t.Errorf("status: хотели ok, получили %s", status)
+	}
+}
+
+// TestComputeForecasts_FromIndicators — сквозной путь: после цикла цен/индикаторов
+// цикл прогнозов читает индикаторы из БД, считает scoring.Forecast и сохраняет
+// результат + декомпозицию по факторам. Монотонно растущий ряд → прогноз «вверх».
+func TestComputeForecasts_FromIndicators(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+
+	forecastRepo := storage.NewForecasts(d)
+	chart := buildMonotonicChart(25, 1723334400000)
+	taker := fakeTaker{
+		coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", Symbol: "btc", Name: "Bitcoin",
+				CurrentPrice: 25, TotalVolume: 1000, LastUpdated: "2024-09-04T00:00:00Z"},
+		},
+		charts: map[string]coingecko.MarketChart{"bitcoin": chart},
+	}
+	w := NewWithTaker(config.Config{FetchIntervalMin: 10}, taker,
+		storage.NewAssets(d), storage.NewSources(d),
+		storage.NewPricePoints(d), storage.NewUpdateLog(d),
+		storage.NewIndicatorSnapshots(d), forecastRepo)
+
+	// Сначала цикл цен/индикаторов, затем — прогнозов.
+	w.fetchOnce(ctx)
+	w.computeForecasts(ctx)
+
+	// Должен появиться активный прогноз по bitcoin (asset_id=1).
+	fc, factors, err := forecastRepo.LatestByAsset(ctx, 1)
+	if err != nil {
+		t.Fatalf("прогноз должен быть сохранён: %v", err)
+	}
+	if fc.Direction != "up" {
+		t.Errorf("монотонный рост: хотели direction=up, получили %s", fc.Direction)
+	}
+	if fc.Confidence < 0.5 || fc.Confidence > 1.0 {
+		t.Errorf("confidence вне [0.5,1.0]: %v", fc.Confidence)
+	}
+	if fc.HorizonHours != 24 {
+		t.Errorf("horizon: хотели 24, получили %d", fc.HorizonHours)
+	}
+	if fc.ArgumentText == "" {
+		t.Error("argument_text не должен быть пустым")
+	}
+	if len(factors) != 3 {
+		t.Errorf("хотели 3 фактора, получили %d", len(factors))
+	}
+
+	// Повторный расчёт — предыдущий прогноз уходит в superseded, новый active.
+	w.computeForecasts(ctx)
+	var nActive, nSuperseded int
+	if err := d.GetContext(ctx, &nActive, `SELECT COUNT(*) FROM forecasts WHERE status='active'`); err != nil {
+		t.Fatalf("count active: %v", err)
+	}
+	if err := d.GetContext(ctx, &nSuperseded, `SELECT COUNT(*) FROM forecasts WHERE status='superseded'`); err != nil {
+		t.Fatalf("count superseded: %v", err)
+	}
+	if nActive != 1 {
+		t.Errorf("хотели 1 active прогноз, получили %d", nActive)
+	}
+	if nSuperseded != 1 {
+		t.Errorf("хотели 1 superseded прогноз (история), получили %d", nSuperseded)
+	}
+}
+
+// TestComputeForecasts_SkipsWithoutIndicators — если индикаторы ещё не посчитаны,
+// цикл прогнозов не падает и не создаёт прогнозов.
+func TestComputeForecasts_SkipsWithoutIndicators(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newWorkerDB(t)
+
+	w := NewWithTaker(config.Config{FetchIntervalMin: 10},
+		fakeTaker{coins: []coingecko.MarketCoin{
+			{ID: "bitcoin", CurrentPrice: 60000, LastUpdated: "2026-08-12T10:00:00Z"},
+		}},
+		storage.NewAssets(d), storage.NewSources(d),
+		storage.NewPricePoints(d), storage.NewUpdateLog(d),
+		storage.NewIndicatorSnapshots(d), storage.NewForecasts(d))
+
+	// fetchOnce не дал исторического ряда → индикаторов нет.
+	w.fetchOnce(ctx)
+	w.computeForecasts(ctx)
+
+	var n int
+	if err := d.GetContext(ctx, &n, `SELECT COUNT(*) FROM forecasts`); err != nil {
+		t.Fatalf("count forecasts: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("без индикаторов не должно быть прогнозов, получили %d", n)
 	}
 }

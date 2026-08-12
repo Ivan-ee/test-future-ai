@@ -349,3 +349,192 @@ func (r indicatorSnapshotRow) toModel() model.IndicatorSnapshot {
 		CalculatedAt: r.CalculatedAt,
 	}
 }
+
+// Forecasts — репозиторий прогнозов и их факторной декомпозиции.
+type Forecasts struct{ db *sqlx.DB }
+
+func NewForecasts(db *sqlx.DB) *Forecasts { return &Forecasts{db: db} }
+
+// SavePersisted — прогноз, готовый к записи: результат scoring + факторы.
+// Используется репозиторием для одной транзакционной вставки.
+type SavePersisted struct {
+	model.Forecast
+	Factors []model.ForecastFactor
+}
+
+// Save записывает новый прогноз и его факторы одной транзакцией, переводя
+// предыдущий active-прогноз по активу в статус superseded. Возвращает id
+// созданного прогноза.
+func (r *Forecasts) Save(ctx context.Context, p SavePersisted) (int64, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx forecasts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op при коммите
+
+	// Предыдущий active → superseded (история остаётся для аудита).
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE forecasts SET status = ? WHERE asset_id = ? AND status = ?`,
+		string(model.ForecastStatusSuperseded), p.AssetID, string(model.ForecastStatusActive)); err != nil {
+		return 0, fmt.Errorf("суперсед прогнозов asset %d: %w", p.AssetID, err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO forecasts (asset_id, created_at, horizon_hours, direction, confidence, risk_note, argument_text, raw_score, status)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.AssetID, p.CreatedAt.UTC(), p.HorizonHours, p.Direction, p.Confidence,
+		p.RiskNote, p.ArgumentText, p.RawScore, string(model.ForecastStatusActive))
+	if err != nil {
+		return 0, fmt.Errorf("вставка forecast asset %d: %w", p.AssetID, err)
+	}
+	forecastID, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("last id forecast: %w", err)
+	}
+
+	for _, f := range p.Factors {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO forecast_factors (forecast_id, name, signal, base_weight, adjusted_weight, contribution, detail)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			forecastID, f.Name, f.Signal, f.BaseWeight, f.AdjustedWeight, f.Contribution, f.Detail); err != nil {
+			return 0, fmt.Errorf("вставка forecast_factor %s: %w", f.Name, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit forecast asset %d: %w", p.AssetID, err)
+	}
+	return forecastID, nil
+}
+
+// LatestByAsset возвращает последний active-прогноз по активу с его факторами.
+// Если прогноза ещё нет — sql.ErrNoRows.
+func (r *Forecasts) LatestByAsset(ctx context.Context, assetID int64) (model.Forecast, []model.ForecastFactor, error) {
+	var fRow forecastRow
+	const fq = `
+SELECT id, asset_id, created_at, horizon_hours, direction, confidence, risk_note, argument_text, raw_score, status
+FROM forecasts WHERE asset_id = ? AND status = ?
+ORDER BY created_at DESC LIMIT 1`
+	if err := r.db.GetContext(ctx, &fRow, fq, assetID, string(model.ForecastStatusActive)); err != nil {
+		return model.Forecast{}, nil, fmt.Errorf("выборка forecast для asset %d: %w", assetID, err)
+	}
+
+	var facRows []forecastFactorRow
+	const ffq = `
+SELECT id, forecast_id, name, signal, base_weight, adjusted_weight, contribution, detail
+FROM forecast_factors WHERE forecast_id = ? ORDER BY id`
+	if err := r.db.SelectContext(ctx, &facRows, ffq, fRow.ID); err != nil {
+		return model.Forecast{}, nil, fmt.Errorf("выборка forecast_factors для forecast %d: %w", fRow.ID, err)
+	}
+	factors := make([]model.ForecastFactor, 0, len(facRows))
+	for _, fr := range facRows {
+		factors = append(factors, fr.toModel())
+	}
+	return fRow.toModel(), factors, nil
+}
+
+// LatestAll возвращает последние active-прогнозы по всем активам (без факторов) —
+// DTO для списка и главной страницы.
+func (r *Forecasts) LatestAll(ctx context.Context) ([]model.ForecastSummary, error) {
+	const q = `
+SELECT
+    f.asset_id   AS asset_id,
+    a.symbol     AS symbol,
+    a.name       AS name,
+    f.direction  AS direction,
+    f.confidence AS confidence,
+    f.created_at AS created_at
+FROM forecasts f
+JOIN assets a ON a.id = f.asset_id
+WHERE f.status = ?
+AND f.id = (
+    SELECT f2.id FROM forecasts f2
+    WHERE f2.asset_id = f.asset_id AND f2.status = ?
+    ORDER BY f2.created_at DESC LIMIT 1
+)
+ORDER BY a.id`
+	var rows []forecastSummaryRow
+	if err := r.db.SelectContext(ctx, &rows, q,
+		string(model.ForecastStatusActive), string(model.ForecastStatusActive)); err != nil {
+		return nil, fmt.Errorf("выборка последних прогнозов: %w", err)
+	}
+	out := make([]model.ForecastSummary, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.toModel())
+	}
+	return out, nil
+}
+
+// --- отображения строк БД прогнозов в доменные типы ---
+
+type forecastRow struct {
+	ID           int64     `db:"id"`
+	AssetID      int64     `db:"asset_id"`
+	CreatedAt    time.Time `db:"created_at"`
+	HorizonHours int       `db:"horizon_hours"`
+	Direction    string    `db:"direction"`
+	Confidence   float64   `db:"confidence"`
+	RiskNote     string    `db:"risk_note"`
+	ArgumentText string    `db:"argument_text"`
+	RawScore     float64   `db:"raw_score"`
+	Status       string    `db:"status"`
+}
+
+func (r forecastRow) toModel() model.Forecast {
+	return model.Forecast{
+		ID:           r.ID,
+		AssetID:      r.AssetID,
+		CreatedAt:    r.CreatedAt,
+		HorizonHours: r.HorizonHours,
+		Direction:    r.Direction,
+		Confidence:   r.Confidence,
+		RiskNote:     r.RiskNote,
+		ArgumentText: r.ArgumentText,
+		RawScore:     r.RawScore,
+		Status:       model.ForecastStatus(r.Status),
+	}
+}
+
+type forecastFactorRow struct {
+	ID             int64   `db:"id"`
+	ForecastID     int64   `db:"forecast_id"`
+	Name           string  `db:"name"`
+	Signal         float64 `db:"signal"`
+	BaseWeight     float64 `db:"base_weight"`
+	AdjustedWeight float64 `db:"adjusted_weight"`
+	Contribution   float64 `db:"contribution"`
+	Detail         string  `db:"detail"`
+}
+
+func (r forecastFactorRow) toModel() model.ForecastFactor {
+	return model.ForecastFactor{
+		ID:             r.ID,
+		ForecastID:     r.ForecastID,
+		Name:           r.Name,
+		Signal:         r.Signal,
+		BaseWeight:     r.BaseWeight,
+		AdjustedWeight: r.AdjustedWeight,
+		Contribution:   r.Contribution,
+		Detail:         r.Detail,
+	}
+}
+
+type forecastSummaryRow struct {
+	AssetID    int64     `db:"asset_id"`
+	Symbol     string    `db:"symbol"`
+	Name       string    `db:"name"`
+	Direction  string    `db:"direction"`
+	Confidence float64   `db:"confidence"`
+	CreatedAt  time.Time `db:"created_at"`
+}
+
+func (r forecastSummaryRow) toModel() model.ForecastSummary {
+	return model.ForecastSummary{
+		AssetID:    r.AssetID,
+		Symbol:     r.Symbol,
+		Name:       r.Name,
+		Direction:  r.Direction,
+		Confidence: r.Confidence,
+		CreatedAt:  r.CreatedAt,
+	}
+}

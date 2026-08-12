@@ -87,6 +87,12 @@ export default async function AssetDetailPage({
         <p className="mt-2 text-sm text-gray-500">
           Источник: CoinGecko · обновлено {formatTime(detail.last_updated)}
         </p>
+        <Link
+          href={`/forecasts/${detail.asset_id}`}
+          className="mt-3 inline-block rounded-md border border-gray-700 px-3 py-1.5 text-sm text-gray-200 transition-colors hover:border-gray-500 hover:bg-gray-800"
+        >
+          → Смотреть прогноз по этой монете
+        </Link>
       </header>
 
       <section className="mb-8 grid grid-cols-2 gap-3 sm:grid-cols-3">

@@ -3,6 +3,13 @@
 // T2: добавлен эндпоинт GET /api/assets/{id} — детальная карточка монеты с
 // текущей ценой и последними значениями технических индикаторов (RSI/ROC/SMA/
 // VolumeSignal) с человекочитаемыми интерпретациями.
+//
+// T3: добавлены эндпоинты прогнозов:
+//   - GET /api/forecasts — последние active-прогнозы по всем монетам (для
+//     главной страницы: стрелка ↑/↓ + confidence).
+//   - GET /api/forecasts/{asset} — детальная карточка прогноза: направление,
+//     уверенность, риск, декомпозиция по факторам и использованные данные.
+//     Параметр {asset} — id актива (как в /api/assets/{id}).
 package server
 
 import (
@@ -29,11 +36,25 @@ type Server struct {
 	cfg            config.Config
 	priceStore     *storage.PricePoints
 	indicatorStore *storage.IndicatorSnapshots
+	forecastStore  *storage.Forecasts
+	assetsStore    *storage.Assets
 }
 
 // New создаёт сервер с заданными зависимостями.
-func New(cfg config.Config, priceStore *storage.PricePoints, indicatorStore *storage.IndicatorSnapshots) *Server {
-	return &Server{cfg: cfg, priceStore: priceStore, indicatorStore: indicatorStore}
+func New(
+	cfg config.Config,
+	priceStore *storage.PricePoints,
+	indicatorStore *storage.IndicatorSnapshots,
+	forecastStore *storage.Forecasts,
+	assetsStore *storage.Assets,
+) *Server {
+	return &Server{
+		cfg:            cfg,
+		priceStore:     priceStore,
+		indicatorStore: indicatorStore,
+		forecastStore:  forecastStore,
+		assetsStore:    assetsStore,
+	}
 }
 
 // Router собирает маршрутизатор chi с middleware и обработчиками.
@@ -61,6 +82,8 @@ func (s *Server) Router() http.Handler {
 		r.Get("/health", s.handleHealth)
 		r.Get("/assets", s.handleAssets)
 		r.Get("/assets/{id}", s.handleAssetDetail)
+		r.Get("/forecasts", s.handleForecasts)
+		r.Get("/forecasts/{asset}", s.handleForecastDetail)
 	})
 
 	return r
@@ -109,6 +132,105 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
 
 	detail := model.AssetDetail{AssetPrice: price, Indicators: s.indicatorsView(r.Context(), id, price.PriceUSD)}
 	writeJSON(w, http.StatusOK, detail)
+}
+
+// handleForecasts возвращает последние active-прогнозы по всем монетам —
+// DTO для главной страницы и списка прогнозов.
+func (s *Server) handleForecasts(w http.ResponseWriter, r *http.Request) {
+	items, err := s.forecastStore.LatestAll(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "не удалось получить прогнозы"})
+		return
+	}
+	if items == nil {
+		items = []model.ForecastSummary{}
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// handleForecastDetail возвращает детальную карточку прогноза по активу:
+// направление, уверенность, риск, аргументацию, декомпозицию по факторам и
+// использованные данные (цена + индикаторы). 404, если актив или прогноз не найдены.
+func (s *Server) handleForecastDetail(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "asset")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "неверный id актива"})
+		return
+	}
+
+	// Нужна цена (для Data.PriceUSD) и метаданные актива (symbol, name).
+	price, err := s.priceStore.LatestByAssetID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "актив не найден"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "не удалось получить актив"})
+		return
+	}
+
+	forecast, factors, err := s.forecastStore.LatestByAsset(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "прогноз ещё не посчитан"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "не удалось получить прогноз"})
+		return
+	}
+
+	view := s.forecastView(forecast, factors, price)
+	writeJSON(w, http.StatusOK, view)
+}
+
+// forecastView собирает DTO прогноза: доменный прогноз + факторы + «использованные
+// данные» (цена и значения индикаторов из снапшота).
+func (s *Server) forecastView(f model.Forecast, factors []model.ForecastFactor, price model.AssetPrice) model.ForecastView {
+	factorViews := make([]model.ForecastFactorView, 0, len(factors))
+	for _, fc := range factors {
+		factorViews = append(factorViews, model.ForecastFactorView{
+			Name:           fc.Name,
+			Signal:         fc.Signal,
+			BaseWeight:     fc.BaseWeight,
+			AdjustedWeight: fc.AdjustedWeight,
+			Contribution:   fc.Contribution,
+			Detail:         fc.Detail,
+		})
+	}
+
+	// Использованные данные: цена из последней точки, индикаторы — из снапшота.
+	// Если индикаторов нет (маловероятно при наличии прогноза) — calculated_at nil.
+	data := model.ForecastDataView{
+		PriceUSD:     price.PriceUSD,
+		Change24H:    price.Change24H,
+		CalculatedAt: nil,
+	}
+	snap, err := s.indicatorStore.ByAsset(context.Background(), price.AssetID)
+	if err == nil {
+		data.RSI = snap.RSI
+		data.ROC = snap.ROC
+		data.SMA7 = snap.SMA7
+		data.SMA20 = snap.SMA20
+		data.VolumeSignal = snap.VolumeSignal
+		calculatedAt := snap.CalculatedAt
+		data.CalculatedAt = &calculatedAt
+	}
+
+	return model.ForecastView{
+		AssetID:      f.AssetID,
+		Symbol:       price.Symbol,
+		Name:         price.Name,
+		CreatedAt:    f.CreatedAt,
+		HorizonHours: f.HorizonHours,
+		Direction:    f.Direction,
+		Confidence:   f.Confidence,
+		RiskNote:     f.RiskNote,
+		ArgumentText: f.ArgumentText,
+		RawScore:     f.RawScore,
+		Factors:      factorViews,
+		Data:         data,
+	}
 }
 
 // indicatorsView собирает представление индикаторов по активу: читает снапшот
