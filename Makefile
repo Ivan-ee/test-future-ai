@@ -77,4 +77,27 @@ fmt: ## Отформатировать Go-код
 
 .PHONY: clean
 clean: ## Удалить собранные артефакты и БД
-	rm -rf $(BIN_DIR) $(FRONTEND)/.next data/*.db data/*.db-* 
+	rm -rf $(BIN_DIR) $(FRONTEND)/.next data/*.db data/*.db-*
+
+.PHONY: smoke
+smoke: ## Smoke-тест: чистая БД → бэкенд наполняет данные → проверка API → остановка
+	@echo "==> Smoke-тест: запуск с чистой БД"
+	@rm -f data/*.db data/*.db-*
+	@mkdir -p data
+	@go run ./cmd/api & API_PID=$$!; \
+	echo "    бэкенд запущен (PID $$API_PID), ждём наполнения БД..."; \
+	sleep 45; \
+	echo "==> Проверка /api/assets:"; \
+	curl -sf http://localhost:$(BACKEND_PORT)/api/assets | \
+		python3 -c "import sys,json; d=json.load(sys.stdin); print('    монет в списке:', len(d)); \
+		[print('     ', x.get('symbol','?'), '$'+str(round(x.get('price_usd',0),2))) for x in d[:5]]" \
+		|| { echo "    ОШИБКА: /api/assets не вернул данные"; kill $$API_PID; exit 1; }; \
+	echo "==> Проверка /api/forecasts:"; \
+	curl -sf http://localhost:$(BACKEND_PORT)/api/forecasts | \
+		python3 -c "import sys,json; d=json.load(sys.stdin); print('    прогнозов:', len(d)); \
+		[print('     ', x.get('symbol','?'), x.get('direction','?'), 'conf='+str(round(x.get('confidence',0),2))) for x in d[:5]]" \
+		|| { echo "    ПРЕДУПРЕЖДЕНИЕ: прогнозы ещё не посчитаны (индикаторы могут копиться)"; }; \
+	echo "==> Проверка /api/health:"; \
+	curl -sf http://localhost:$(BACKEND_PORT)/api/health && echo ""; \
+	echo "==> Smoke-тест пройден, останавливаю бэкенд"; \
+	kill $$API_PID 2>/dev/null || true; wait $$API_PID 2>/dev/null || true
