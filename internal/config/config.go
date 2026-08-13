@@ -17,6 +17,8 @@ import (
 // Config — конфигурация приложения.
 type Config struct {
 	OpenAIAPIKey       string
+	OpenAIBaseURL      string // базовый URL OpenAI-совместимого API (для Kimi/DeepSeek/локальных)
+	OpenAIModel        string // модель для оценки сентимента (по умолчанию gpt-4o-mini)
 	CoinGeckoBaseURL   string
 	CoinPaprikaBaseURL string
 	BackendPort        int
@@ -33,6 +35,8 @@ func Load() (Config, error) {
 
 	cfg := Config{
 		OpenAIAPIKey:       getenv("OPENAI_API_KEY", ""),
+		OpenAIBaseURL:      getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		OpenAIModel:        getenv("OPENAI_MODEL", "gpt-4o-mini"),
 		CoinGeckoBaseURL:   getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
 		CoinPaprikaBaseURL: getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1"),
 		DBPath:             getenv("DB_PATH", "data/testfuture.db"),

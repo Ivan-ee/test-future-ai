@@ -62,7 +62,7 @@ func run() error {
 	factorStatsRepo := storage.NewFactorStats(database) // T5
 
 	// Сентимент-сервис (noop без OPENAI_API_KEY — прогноз на 3 факторах).
-	sentimentSvc := sentiment.New(cfg.OpenAIAPIKey, newsRepo)
+	sentimentSvc := sentiment.New(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.OpenAIModel, newsRepo)
 	if !sentimentSvc.Enabled() {
 		log.Printf("OPENAI_API_KEY не задан — сентимент выключен, прогноз без 4-го фактора")
 	}

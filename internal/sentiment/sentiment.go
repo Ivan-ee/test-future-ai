@@ -53,13 +53,16 @@ type Service struct {
 	enabled bool
 }
 
-// New создаёт сервис с реальным OpenAI-клиентом. apiKey пустой → noop-режим.
-func New(apiKey string, store *storage.NewsItems) *Service {
+// New создаёт сервис с реальным OpenAI-совместимым клиентом. apiKey пустой →
+// noop-режим. baseURL задаёт эндпоинт провайдера (по умолчанию api.openai.com,
+// но можно указать OpenAI-совместимый — Kimi/Moonshot, DeepSeek, OpenRouter,
+// локальный Ollama). model — имя модели для оценки сентимента.
+func New(apiKey, baseURL, model string, store *storage.NewsItems) *Service {
 	if apiKey == "" {
 		return &Service{store: store, cache: map[string]ScoreResult{}, enabled: false}
 	}
 	return &Service{
-		client:  newOpenAIClient(apiKey),
+		client:  newOpenAIClient(apiKey, baseURL, model),
 		store:   store,
 		cache:   map[string]ScoreResult{},
 		enabled: true,
@@ -179,10 +182,18 @@ func headline(n model.NewsItem) string {
 
 type openaiClient struct {
 	client *openai.Client
+	model  string
 }
 
-func newOpenAIClient(apiKey string) *openaiClient {
-	return &openaiClient{client: openai.NewClient(apiKey)}
+// newOpenAIClient собирает клиент с кастомным BaseURL — это позволяет работать
+// с любым OpenAI-совместимым провайдером (Kimi/Moonshot, DeepSeek, OpenRouter,
+// локальный Ollama), а не только с api.openai.com.
+func newOpenAIClient(apiKey, baseURL, model string) *openaiClient {
+	cfg := openai.DefaultConfig(apiKey)
+	if baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	return &openaiClient{client: openai.NewClientWithConfig(cfg), model: model}
 }
 
 // sentimentResponse — ожидаемый JSON из ответа модели.
@@ -194,8 +205,12 @@ type sentimentResponse struct {
 // с массивом результатов (score + summary для каждого по индексу).
 func (c *openaiClient) Score(ctx context.Context, headlines []string) ([]ScoreResult, error) {
 	prompt := buildPrompt(headlines)
+	model := c.model
+	if model == "" {
+		model = openai.GPT4oMini
+	}
 	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: openai.GPT4oMini,
+		Model: model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt()},
 			{Role: openai.ChatMessageRoleUser, Content: prompt},

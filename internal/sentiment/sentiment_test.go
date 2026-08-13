@@ -176,7 +176,7 @@ func TestNew_NoApiKeyDisabled(t *testing.T) {
 	defer func() { _ = d.Close() }()
 	store := storage.NewNewsItems(d)
 
-	svc := New("", store)
+	svc := New("", "", "", store)
 	if svc.Enabled() {
 		t.Error("без API-ключа сервис должен быть выключен")
 	}

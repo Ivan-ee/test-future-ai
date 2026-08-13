@@ -99,7 +99,7 @@ func newWorkerDeps(d *sqlx.DB) workerDeps {
 		indicators:  storage.NewIndicatorSnapshots(d),
 		forecasts:   storage.NewForecasts(d),
 		news:        news,
-		sentiment:   sentiment.New("", news), // noop по умолчанию
+		sentiment:   sentiment.New("", "", "", news), // noop по умолчанию
 		outcomes:    storage.NewOutcomes(d),
 		factorStats: storage.NewFactorStats(d),
 	}
