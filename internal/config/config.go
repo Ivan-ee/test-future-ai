@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -24,7 +25,8 @@ type Config struct {
 	BackendPort        int
 	FrontendPort       int
 	DBPath             string
-	FetchIntervalMin   int // период опроса источников, минут (по умолчанию 10)
+	FetchIntervalMin   int           // период опроса источников, минут (по умолчанию 10)
+	CoinGeckoChartDelay time.Duration // пауза между запросами market_chart (rate-limit free-tier)
 }
 
 // Load загружает конфигурацию: сначала пробует .env в корне репозитория, затем
@@ -38,9 +40,13 @@ func Load() (Config, error) {
 		OpenAIBaseURL:      getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		OpenAIModel:        getenv("OPENAI_MODEL", "gpt-4o-mini"),
 		CoinGeckoBaseURL:   getenv("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
-		CoinPaprikaBaseURL: getenv("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1"),
+		// CoinPaprika убрал публичный endpoint новостей — источник отключаемый:
+		// явное пустое значение (COINPAPRIKA_BASE_URL=) выключает его. Если
+		// переменная не задана вообще — берётся дефолтный URL (обратная совместимость).
+		CoinPaprikaBaseURL: getenvOptOut("COINPAPRIKA_BASE_URL", "https://api.coinpaprika.com/v1"),
 		DBPath:             getenv("DB_PATH", "data/testfuture.db"),
 		FetchIntervalMin:   getenvInt("FETCH_INTERVAL_MIN", 10),
+		CoinGeckoChartDelay: 15 * time.Second, // free-tier: ~4 запроса/мин на market_chart
 	}
 	cfg.BackendPort = getenvInt("BACKEND_PORT", 8081)
 	cfg.FrontendPort = getenvInt("FRONTEND_PORT", 3001)
@@ -76,6 +82,17 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// getenvOptOut — как getenv, но различает «не задана» (→ дефолт) и «задана
+// пустой строкой» (→ "", источник отключен). Используется для опциональных
+// источников, которые можно выключить явным пустым значением в .env.
+func getenvOptOut(key, def string) string {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	return v // задана, в т.ч. пустой строкой — уважаем явный выбор
 }
 
 func getenvInt(key string, def int) int {

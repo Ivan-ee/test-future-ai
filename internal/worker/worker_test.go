@@ -433,7 +433,8 @@ func TestFetchNews_CoinPaprikaWritesItems(t *testing.T) {
 			RelatedCoins: []string{"btc-bitcoin"}},
 	}}
 	w := NewWithTakers(
-		config.Config{FetchIntervalMin: 10}, taker, news, fakeRSSTaker{},
+		config.Config{FetchIntervalMin: 10, CoinPaprikaBaseURL: "https://fake.test/v1"},
+		taker, news, fakeRSSTaker{},
 		deps.assets, deps.sources, deps.prices, deps.logs,
 		deps.indicators, deps.forecasts, deps.news, deps.sentiment,
 		deps.outcomes, deps.factorStats,

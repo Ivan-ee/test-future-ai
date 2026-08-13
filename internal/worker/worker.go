@@ -235,7 +235,19 @@ func (w *Worker) fetchOnce(ctx context.Context) {
 	}
 
 	// T2: рыночные графики за 30 дней + расчёт индикаторов по каждой монете.
+	// Между запросами делаем паузу (config.CoinGeckoChartDelay): free-tier
+	// CoinGecko жёстко лимитирует (5 market_chart подряд без задержки → 429 на
+	// 3–4-й монете). В тестах задержка нулевая (config.Config{} => zero value).
+	first := true
 	for coinID, asset := range byID {
+		if !first && w.cfg.CoinGeckoChartDelay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(w.cfg.CoinGeckoChartDelay):
+			}
+		}
+		first = false
 		if err := w.fetchChartAndIndicators(ctx, asset, coinID, src.ID); err != nil {
 			// Ошибка на одной монете не валит весь цикл.
 			log.Printf("worker: индикаторы для %s: %v", coinID, err)
@@ -259,9 +271,13 @@ func (w *Worker) fetchNews(ctx context.Context) {
 		return
 	}
 
-	// CoinPaprika: один запрос на все монеты.
-	if err := w.fetchCoinPaprikaNews(ctx, byID); err != nil {
-		log.Printf("worker: новости CoinPaprika: %v", err)
+	// CoinPaprika: один запрос на все монеты. Пропускается, если источник
+	// выключен пустым COINPAPRIKA_BASE_URL (публичный endpoint новостей убран,
+	// см. docs — пока альтернативы нет, RSS покрывает потребность).
+	if w.cfg.CoinPaprikaBaseURL != "" {
+		if err := w.fetchCoinPaprikaNews(ctx, byID); err != nil {
+			log.Printf("worker: новости CoinPaprika: %v", err)
+		}
 	}
 
 	// RSS: по одной ленте на источник.
