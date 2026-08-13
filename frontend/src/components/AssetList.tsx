@@ -24,7 +24,10 @@ export default function AssetList({ initialAssets, initialForecasts }: Props) {
   const [items, setItems] = useState<AssetPrice[]>(initialAssets);
   const [forecasts, setForecasts] = useState<ForecastSummary[]>(initialForecasts);
   const [error, setError] = useState<string | null>(null);
-  const [updatedAt, setUpdatedAt] = useState<Date>(new Date());
+  // updatedAt — null при SSR и первом рендере клиента, чтобы избежать hydration
+  // mismatch: время на сервере и клиенте расходится на доли секунды, и React
+  // падает. Реальное время ставим только после монтирования (в useEffect).
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -46,6 +49,9 @@ export default function AssetList({ initialAssets, initialForecasts }: Props) {
   }, []);
 
   useEffect(() => {
+    // Сразу ставим время после монтирования (избегаем hydration mismatch),
+    // затем обновляем по таймеру.
+    setUpdatedAt(new Date());
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
   }, [refresh]);
@@ -59,7 +65,7 @@ export default function AssetList({ initialAssets, initialForecasts }: Props) {
         <div>
           <h2 className="text-xl font-semibold">Отслеживаемые монеты</h2>
           <p className="text-sm text-gray-400">
-            Обновлено: {updatedAt.toLocaleTimeString("ru-RU")}
+            {updatedAt ? `Обновлено: ${updatedAt.toLocaleTimeString("ru-RU")}` : "Обновлено: —"}
             {error && (
               <span className="ml-2 text-red-400">ошибка: {error}</span>
             )}
