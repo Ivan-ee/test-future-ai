@@ -141,7 +141,7 @@ type Forecast struct {
 type ForecastFactor struct {
 	ID             int64
 	ForecastID     int64
-	Name           string  // "rsi" | "momentum" | "volume"
+	Name           string  // "rsi" | "momentum" | "volume" | "sentiment"
 	Signal         float64 // [-1..1]
 	BaseWeight     float64 // исходный вес до нормировки
 	AdjustedWeight float64 // нормированный вес (сумма по факторам = 1.0)

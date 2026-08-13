@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS forecasts (
     risk_note      TEXT    NOT NULL DEFAULT '',
     argument_text  TEXT    NOT NULL DEFAULT '',
     raw_score      REAL    NOT NULL,
-    status         TEXT    NOT NULL DEFAULT 'active' -- "active" | "superseded"
+    status         TEXT    NOT NULL DEFAULT 'active' -- "active" | "superseded" | "resolved"
 );
 
 CREATE INDEX IF NOT EXISTS idx_forecasts_asset_created

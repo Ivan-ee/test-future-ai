@@ -137,9 +137,9 @@ func Forecast(factors []Factor, weights map[FactorName]float64) ForecastResult {
 }
 
 // computeConfidence: 0.5 + |raw_score|/2 со штрафом за противоречие факторов.
-// Противоречие — если 2+ из 3 факторов смотрят в сторону, противоречащую итогу
-// (signal направлен против direction). Каждый противоречащий фактор снижает
-// confidence на 0.05.
+// Противоречие — если 2+ из присутствующих факторов смотрят в сторону,
+// противоречащую итогу (signal направлен против direction). Каждый
+// противоречащий фактор снижает confidence на 0.05.
 func computeConfidence(rawScore float64, factors []AdjustedFactor, direction Direction) float64 {
 	base := 0.5 + math.Abs(rawScore)/2
 

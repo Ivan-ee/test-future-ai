@@ -334,3 +334,43 @@ func TestForecast_SentimentFlipsDirection(t *testing.T) {
 			r.Direction, r.RawScore)
 	}
 }
+
+// TestREADMEExample — численный пример из README («какие цифры должны сойти»).
+// Фиксирует конкретные сигналы и ожидаемый результат, чтобы раздел README и
+// код scoring не разошлись. Если этот тест падает — числа в README стали ложными.
+//
+// Сценарий: RSI=40 (перепроданность → вверх), моментум умеренно вверх,
+// объём в норме, новости негативные. Сигналы взяты как данные (шаг 2).
+//
+//	Базовые веса 4 факторов суммируются в 1.0 → adjusted_weight = base_weight.
+//	raw_score  = 0.50×0.25 + 0.30×0.35 + 0.00×0.15 + (−0.40)×0.25
+//	           = 0.125 + 0.105 + 0.000 − 0.100 = +0.1300
+//	direction  = up (raw_score ≥ 0)
+//	confidence = 0.5 + |0.1300|/2 = 0.5650 (противоречит только sentiment — 1 фактор, штрафа нет)
+func TestREADMEExample(t *testing.T) {
+	t.Parallel()
+	factors := []Factor{
+		{Name: FactorRSI, Signal: 0.50},
+		{Name: FactorMomentum, Signal: 0.30},
+		{Name: FactorVolume, Signal: 0.00},
+		{Name: FactorSentiment, Signal: -0.40},
+	}
+	r := Forecast(factors, nil)
+
+	if r.Direction != DirectionUp {
+		t.Errorf("direction: хотели up, получили %s", r.Direction)
+	}
+	approx(t, "raw_score", r.RawScore, 0.1300)
+	approx(t, "confidence", r.Confidence, 0.5650)
+
+	// Проверяем вклады каждого фактора — они фигурируют в таблице README.
+	wantContrib := map[FactorName]float64{
+		FactorRSI:       0.1250,
+		FactorMomentum:  0.1050,
+		FactorVolume:    0.0000,
+		FactorSentiment: -0.1000,
+	}
+	for _, f := range r.Factors {
+		approx(t, "contribution/"+string(f.Name), f.Contribution, wantContrib[f.Name])
+	}
+}
