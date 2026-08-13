@@ -55,13 +55,19 @@ make dev                   # бэкенд :8081 + фронтенд :3001
 
 | Переменная            | По умолчанию                          | Описание                          |
 | --------------------- | ------------------------------------- | --------------------------------- |
-| `OPENAI_API_KEY`      | _(пусто)_                             | Ключ OpenAI (сентимент новостей)  |
+| `OPENAI_API_KEY`      | _(пусто)_                             | Ключ провайдера ИИ (сентимент)    |
+| `OPENAI_BASE_URL`     | `https://api.openai.com/v1`           | Эндпоинт OpenAI-совместимого API  |
+| `OPENAI_MODEL`        | `gpt-4o-mini`                         | Модель для оценки сентимента      |
 | `COINGECKO_BASE_URL`  | `https://api.coingecko.com/api/v3`    | Базовый URL CoinGecko API         |
 | `COINPAPRIKA_BASE_URL`| `https://api.coinpaprika.com/v1`      | Базовый URL CoinPaprika API       |
 | `BACKEND_PORT`        | `8081`                                | Порт Go-бэкенда                   |
 | `FRONTEND_PORT`       | `3001`                                | Порт Next.js фронтенда            |
 | `DB_PATH`             | `data/testfuture.db`                  | Путь к файлу SQLite               |
 | `FETCH_INTERVAL_MIN`  | `10`                                  | Период опроса источников, минут   |
+
+> **Любой OpenAI-совместимый провайдер.** Сентимент работает не только с OpenAI,
+> но и с Kimi/Moonshot, DeepSeek, OpenRouter, локальным Ollama — достаточно задать
+> `OPENAI_BASE_URL` и `OPENAI_MODEL`. Примеры — в `.env.example`.
 
 ---
 
